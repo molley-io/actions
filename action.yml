@@ -28,7 +28,8 @@ inputs:
     default: .molley/features.md
   webhook_url:
     description: Public Molley webhook URL
-    required: true
+    required: false
+    default: https://api.molley.io/public/github/analyzer/webhook
 
 outputs:
   head_sha:
