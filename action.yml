@@ -54,17 +54,22 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        echo "[molley] Validating required environment"
         if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
           echo "ANTHROPIC_API_KEY is required"
           exit 1
         fi
+        echo "[molley] ANTHROPIC_API_KEY is present"
 
     - name: Install Claude Code CLI
       shell: bash
       run: |
         set -euo pipefail
+        echo "[molley] Installing Claude Code CLI"
         npm install -g @anthropic-ai/claude-code
         echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
+        echo "[molley] Node version: $(node --version)"
+        echo "[molley] npm version: $(npm --version)"
 
     - name: Generate features markdown with Claude Code
       id: analyze
@@ -76,9 +81,13 @@ runs:
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
       run: |
         set -euo pipefail
+        echo "[molley] Starting repository analysis"
+        echo "[molley] Analysis depth: ${ANALYSIS_DEPTH}"
+        echo "[molley] Focus directories: ${ANALYZE_DIRECTORIES:-<all>}"
+        echo "[molley] Features output: ${FEATURES_FILE_PATH}"
         mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
         ANALYZER_FAILED=0
-        PROMPT="Analyze this repository and update ${FEATURES_FILE_PATH} with implemented features. Use headings and bullets for status, description, key files, and dependencies. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
+        PROMPT="Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}. Return markdown only (no prose before/after), using this structure for each feature: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
 
         if command -v claude-code >/dev/null 2>&1; then
           CLAUDE_BIN="claude-code"
@@ -89,19 +98,52 @@ runs:
         fi
 
         if [ -n "$CLAUDE_BIN" ]; then
-          if "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--print'; then
-            "$CLAUDE_BIN" --print "$PROMPT" || ANALYZER_FAILED=1
-          elif "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--prompt'; then
-            "$CLAUDE_BIN" --prompt "$PROMPT" || ANALYZER_FAILED=1
+          echo "[molley] Using CLI binary: $CLAUDE_BIN"
+          CLI_HELP="$($CLAUDE_BIN --help 2>&1 || true)"
+          heartbeat() {
+            while true; do
+              echo "[molley] Analyzer still running..."
+              sleep 20
+            done
+          }
+
+          heartbeat &
+          HEARTBEAT_PID=$!
+
+          if printf '%s' "$CLI_HELP" | grep -q -- '--print'; then
+            echo "[molley] Running analyzer with --print and writing output file"
+            "$CLAUDE_BIN" --print "$PROMPT" > "$FEATURES_FILE_PATH" || ANALYZER_FAILED=1
+          elif printf '%s' "$CLI_HELP" | grep -q -- '--prompt'; then
+            echo "[molley] Running analyzer with --prompt"
+            if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
+              "$CLAUDE_BIN" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
+            else
+              "$CLAUDE_BIN" --prompt "$PROMPT" || ANALYZER_FAILED=1
+            fi
           else
-            "$CLAUDE_BIN" "$PROMPT" || ANALYZER_FAILED=1
+            echo "[molley] Running analyzer with positional prompt"
+            if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
+              "$CLAUDE_BIN" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
+            else
+              "$CLAUDE_BIN" "$PROMPT" || ANALYZER_FAILED=1
+            fi
           fi
+
+          kill "$HEARTBEAT_PID" 2>/dev/null || true
+          wait "$HEARTBEAT_PID" 2>/dev/null || true
         else
           echo "Claude CLI binary not found after install; using fallback output"
           ANALYZER_FAILED=1
         fi
 
+        if [ -s "$FEATURES_FILE_PATH" ] && grep -qi 'blocked pending your approval' "$FEATURES_FILE_PATH"; then
+          echo "[molley] Analyzer response indicates permission approval block"
+          ANALYZER_FAILED=1
+          rm -f "$FEATURES_FILE_PATH"
+        fi
+
         if [ ! -s "$FEATURES_FILE_PATH" ]; then
+          echo "[molley] Analyzer did not produce features markdown; writing fallback content"
           printf '%s\n' \
             '# Project Features' \
             '' \
@@ -113,10 +155,14 @@ runs:
             > "$FEATURES_FILE_PATH"
         fi
 
+        echo "[molley] Features markdown size: $(wc -c < "$FEATURES_FILE_PATH") bytes"
+
         if [ "$ANALYZER_FAILED" -ne 0 ]; then
           echo "Claude analysis command failed"
           exit 1
         fi
+
+        echo "[molley] Analyzer command completed successfully"
 
     - name: Commit analyzer output
       id: commit
@@ -125,15 +171,19 @@ runs:
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
       run: |
         set -euo pipefail
+        echo "[molley] Checking for analyzer output changes"
         git config user.name "molley-bot"
         git config user.email "actions@users.noreply.github.com"
 
         git add "$FEATURES_FILE_PATH"
         if git diff --cached --quiet; then
+          echo "[molley] No changes to commit"
           echo "changed=false" >> "$GITHUB_OUTPUT"
         else
+          echo "[molley] Committing analyzer output"
           git commit -m "chore(molley): update features analysis"
           git push
+          echo "[molley] Changes pushed to repository"
           echo "changed=true" >> "$GITHUB_OUTPUT"
         fi
 
@@ -143,6 +193,7 @@ runs:
       run: |
         set -euo pipefail
         echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "[molley] HEAD SHA: $(git rev-parse HEAD)"
 
     - name: Notify Molley webhook
       if: always()
@@ -157,6 +208,7 @@ runs:
         HEAD_SHA: ${{ steps.git-state.outputs.head_sha }}
       run: |
         set -euo pipefail
+        echo "[molley] Preparing analyzer webhook callback"
 
         if [ "$ANALYZE_OUTCOME" = "success" ]; then
           EVENT="analyzer.completed"
@@ -203,7 +255,12 @@ runs:
           curl_headers+=( -H "x-molley-signature: sha256=${signature}" )
         fi
 
+        echo "[molley] Sending webhook event '${EVENT}' for run '${EFFECTIVE_RUN_ID}'"
+        echo "[molley] Webhook URL: ${WEBHOOK_URL}"
+
         curl --fail --silent --show-error \
           -X POST "$WEBHOOK_URL" \
           "${curl_headers[@]}" \
           --data "$payload"
+
+        echo "[molley] Webhook callback delivered"
