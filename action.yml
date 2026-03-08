@@ -87,6 +87,7 @@ runs:
         echo "[molley] Features output: ${FEATURES_FILE_PATH}"
         mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
         ANALYZER_FAILED=0
+        CLAUDE_MODEL="claude-opus-4-6"
         PROMPT_FILE="$(mktemp)"
         {
           printf '%s\n' "Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}."
@@ -119,6 +120,13 @@ runs:
         if [ -n "$CLAUDE_BIN" ]; then
           echo "[molley] Using CLI binary: $CLAUDE_BIN"
           CLI_HELP="$($CLAUDE_BIN --help 2>&1 || true)"
+          MODEL_ARGS=()
+          if printf '%s' "$CLI_HELP" | grep -q -- '--model'; then
+            MODEL_ARGS=(--model "$CLAUDE_MODEL")
+            echo "[molley] Using model: ${CLAUDE_MODEL}"
+          else
+            echo "[molley] CLI does not support --model flag; using CLI default model"
+          fi
           heartbeat() {
             while true; do
               echo "[molley] Analyzer still running..."
@@ -131,20 +139,20 @@ runs:
 
           if printf '%s' "$CLI_HELP" | grep -q -- '--print'; then
             echo "[molley] Running analyzer with --print and writing output file"
-            "$CLAUDE_BIN" --print "$PROMPT" > "$FEATURES_FILE_PATH" || ANALYZER_FAILED=1
+            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$FEATURES_FILE_PATH" || ANALYZER_FAILED=1
           elif printf '%s' "$CLI_HELP" | grep -q -- '--prompt'; then
             echo "[molley] Running analyzer with --prompt"
             if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
-              "$CLAUDE_BIN" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
             else
-              "$CLAUDE_BIN" --prompt "$PROMPT" || ANALYZER_FAILED=1
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
             fi
           else
             echo "[molley] Running analyzer with positional prompt"
             if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
-              "$CLAUDE_BIN" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
             else
-              "$CLAUDE_BIN" "$PROMPT" || ANALYZER_FAILED=1
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
             fi
           fi
 
