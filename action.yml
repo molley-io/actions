@@ -87,7 +87,26 @@ runs:
         echo "[molley] Features output: ${FEATURES_FILE_PATH}"
         mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
         ANALYZER_FAILED=0
-        PROMPT="Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}. Return markdown only (no prose before/after), using this structure for each feature: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
+        PROMPT_FILE="$(mktemp)"
+        {
+          printf '%s\n' "Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}."
+          printf '%s\n' "Return markdown only (no prose before/after)."
+          printf '%s\n' "Output one section per feature using: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'."
+          printf '%s\n' "De-duplicate features semantically: if an existing feature represents the same capability, keep one canonical section and do not create a renamed duplicate."
+          printf '%s\n' "Preserve already-known features unless they are clearly incorrect."
+          printf '%s\n' "Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
+
+          if [ -s "$FEATURES_FILE_PATH" ]; then
+            printf '\n%s\n' "Existing feature baseline from ${FEATURES_FILE_PATH} (treat as already known features):"
+            printf '%s\n' "-----BEGIN EXISTING FEATURES-----"
+            head -c 15000 "$FEATURES_FILE_PATH"
+            printf '%s\n' "-----END EXISTING FEATURES-----"
+            echo "[molley] Seeded analyzer prompt with existing features baseline" >&2
+          else
+            echo "[molley] No existing features baseline found; running full analysis" >&2
+          fi
+        } > "$PROMPT_FILE"
+        PROMPT="$(cat "$PROMPT_FILE")"
 
         if command -v claude-code >/dev/null 2>&1; then
           CLAUDE_BIN="claude-code"
@@ -141,6 +160,8 @@ runs:
           ANALYZER_FAILED=1
           rm -f "$FEATURES_FILE_PATH"
         fi
+
+        rm -f "$PROMPT_FILE"
 
         if [ ! -s "$FEATURES_FILE_PATH" ]; then
           echo "[molley] Analyzer did not produce features markdown; writing fallback content"
