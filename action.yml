@@ -61,7 +61,10 @@ runs:
 
     - name: Install Claude Code CLI
       shell: bash
-      run: npm install -g @anthropic-ai/claude-code
+      run: |
+        set -euo pipefail
+        npm install -g @anthropic-ai/claude-code
+        echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
 
     - name: Generate features markdown with Claude Code
       id: analyze
@@ -75,7 +78,19 @@ runs:
         set -euo pipefail
         mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
 
-        claude-code --prompt "Analyze this repository and update ${FEATURES_FILE_PATH} with implemented features. Use headings and bullets for status, description, key files, and dependencies. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}." || true
+        if command -v claude-code >/dev/null 2>&1; then
+          CLAUDE_BIN="claude-code"
+        elif command -v claude >/dev/null 2>&1; then
+          CLAUDE_BIN="claude"
+        else
+          CLAUDE_BIN=""
+        fi
+
+        if [ -n "$CLAUDE_BIN" ]; then
+          "$CLAUDE_BIN" --prompt "Analyze this repository and update ${FEATURES_FILE_PATH} with implemented features. Use headings and bullets for status, description, key files, and dependencies. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}." || true
+        else
+          echo "Claude CLI binary not found after install; using fallback output"
+        fi
 
         if [ ! -s "$FEATURES_FILE_PATH" ]; then
           printf '%s\n' \
