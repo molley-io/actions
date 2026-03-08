@@ -77,6 +77,8 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
+        ANALYZER_FAILED=0
+        PROMPT="Analyze this repository and update ${FEATURES_FILE_PATH} with implemented features. Use headings and bullets for status, description, key files, and dependencies. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
 
         if command -v claude-code >/dev/null 2>&1; then
           CLAUDE_BIN="claude-code"
@@ -87,9 +89,16 @@ runs:
         fi
 
         if [ -n "$CLAUDE_BIN" ]; then
-          "$CLAUDE_BIN" --prompt "Analyze this repository and update ${FEATURES_FILE_PATH} with implemented features. Use headings and bullets for status, description, key files, and dependencies. Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}." || true
+          if "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--print'; then
+            "$CLAUDE_BIN" --print "$PROMPT" || ANALYZER_FAILED=1
+          elif "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--prompt'; then
+            "$CLAUDE_BIN" --prompt "$PROMPT" || ANALYZER_FAILED=1
+          else
+            "$CLAUDE_BIN" "$PROMPT" || ANALYZER_FAILED=1
+          fi
         else
           echo "Claude CLI binary not found after install; using fallback output"
+          ANALYZER_FAILED=1
         fi
 
         if [ ! -s "$FEATURES_FILE_PATH" ]; then
@@ -102,6 +111,11 @@ runs:
             '- **Key Files:** None' \
             '- **Dependencies:** None' \
             > "$FEATURES_FILE_PATH"
+        fi
+
+        if [ "$ANALYZER_FAILED" -ne 0 ]; then
+          echo "Claude analysis command failed"
+          exit 1
         fi
 
     - name: Commit analyzer output
