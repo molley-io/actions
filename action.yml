@@ -204,17 +204,49 @@ runs:
         git config user.name "molley-bot"
         git config user.email "actions@users.noreply.github.com"
 
-        git add "$FEATURES_FILE_PATH"
-        if git diff --cached --quiet; then
-          echo "[molley] No changes to commit"
-          echo "changed=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "[molley] Committing analyzer output"
+        target_branch="${GITHUB_REF_NAME:-main}"
+        snapshot_file="$(mktemp)"
+        cp "$FEATURES_FILE_PATH" "$snapshot_file"
+
+        pushed="false"
+        changed="false"
+
+        for attempt in 1 2 3; do
+          echo "[molley] Sync attempt ${attempt}/3 on branch ${target_branch}"
+          git fetch origin "$target_branch"
+          git checkout -B "molley-analyzer-${GITHUB_RUN_ID:-local}" "origin/$target_branch"
+
+          mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
+          cp "$snapshot_file" "$FEATURES_FILE_PATH"
+
+          git add "$FEATURES_FILE_PATH"
+          if git diff --cached --quiet; then
+            echo "[molley] No changes to commit after syncing with origin/${target_branch}"
+            changed="false"
+            pushed="true"
+            break
+          fi
+
+          changed="true"
           git commit -m "chore(molley): update features analysis"
-          git push
-          echo "[molley] Changes pushed to repository"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+          if git push origin "HEAD:${target_branch}"; then
+            echo "[molley] Changes pushed to ${target_branch}"
+            pushed="true"
+            break
+          fi
+
+          echo "[molley] Push failed due to branch movement; retrying"
+        done
+
+        rm -f "$snapshot_file"
+
+        if [ "$pushed" != "true" ]; then
+          echo "[molley] Failed to push analyzer output after retries"
+          exit 1
         fi
+
+        echo "changed=${changed}" >> "$GITHUB_OUTPUT"
 
     - name: Read git state
       id: git-state
@@ -229,6 +261,7 @@ runs:
       shell: bash
       env:
         ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
+        COMMIT_OUTCOME: ${{ steps.commit.outcome }}
         RUN_ID: ${{ inputs.run_id }}
         MOLLEY_PROJECT_ID: ${{ inputs.molley_project_id }}
         ANALYSIS_DEPTH: ${{ inputs.analysis_depth }}
@@ -239,7 +272,7 @@ runs:
         set -euo pipefail
         echo "[molley] Preparing analyzer webhook callback"
 
-        if [ "$ANALYZE_OUTCOME" = "success" ]; then
+        if [ "$ANALYZE_OUTCOME" = "success" ] && [ "$COMMIT_OUTCOME" = "success" ]; then
           EVENT="analyzer.completed"
           CONCLUSION="success"
         else
