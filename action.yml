@@ -170,22 +170,47 @@ runs:
           heartbeat &
           HEARTBEAT_PID=$!
 
-          if printf '%s' "$CLI_HELP" | grep -q -- '--print'; then
-            echo "[molley] Running analyzer with --print and writing output file"
-            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
-          elif printf '%s' "$CLI_HELP" | grep -q -- '--prompt'; then
-            echo "[molley] Running analyzer with --prompt"
-            if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
-            else
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
-            fi
-          else
-            echo "[molley] Running analyzer with positional prompt"
-            if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
+          HAS_PRINT=0
+          HAS_PROMPT=0
+          HAS_SKIP_PERMS=0
+          printf '%s' "$CLI_HELP" | grep -q -- '--print' && HAS_PRINT=1
+          printf '%s' "$CLI_HELP" | grep -q -- '--prompt' && HAS_PROMPT=1
+          printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions' && HAS_SKIP_PERMS=1
+
+          if [ "$MOLLEY_MODE" = "build" ]; then
+            # Build mode: Claude must write files, so use --prompt (not --print)
+            # and --dangerously-skip-permissions to allow file writes in CI
+            echo "[molley] Build mode — using interactive prompt with file-write permissions"
+            if [ "$HAS_PROMPT" = "1" ]; then
+              if [ "$HAS_SKIP_PERMS" = "1" ]; then
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
+              else
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
+              fi
+            elif [ "$HAS_SKIP_PERMS" = "1" ]; then
               "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
             else
               "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
+            fi
+          else
+            # Analyzer / Analyze mode: capture text output only via --print
+            if [ "$HAS_PRINT" = "1" ]; then
+              echo "[molley] Running with --print and writing output file"
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
+            elif [ "$HAS_PROMPT" = "1" ]; then
+              echo "[molley] Running with --prompt"
+              if [ "$HAS_SKIP_PERMS" = "1" ]; then
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
+              else
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
+              fi
+            else
+              echo "[molley] Running with positional prompt"
+              if [ "$HAS_SKIP_PERMS" = "1" ]; then
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
+              else
+                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
+              fi
             fi
           fi
 
@@ -289,6 +314,74 @@ runs:
 
         echo "changed=${changed}" >> "$GITHUB_OUTPUT"
 
+    - name: Commit and PR build output
+      id: build-commit
+      if: inputs.mode == 'build' && steps.analyze.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        echo "[molley] Checking for build output changes"
+        git config user.name "molley-bot"
+        git config user.email "actions@users.noreply.github.com"
+
+        BRANCH_NAME="${GITHUB_REF_NAME}"
+        FILES_CHANGED=$(git diff --name-only | wc -l)
+        UNTRACKED=$(git ls-files --others --exclude-standard | wc -l)
+        TOTAL_CHANGED=$((FILES_CHANGED + UNTRACKED))
+
+        echo "[molley] Files modified: ${FILES_CHANGED}, new: ${UNTRACKED}, total: ${TOTAL_CHANGED}"
+
+        if [ "$TOTAL_CHANGED" -eq 0 ]; then
+          echo "[molley] No file changes detected from build"
+          echo "files_changed=0" >> "$GITHUB_OUTPUT"
+          echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        git add -A
+        git commit -m "feat(molley): code writer build output"
+
+        git push origin "HEAD:${BRANCH_NAME}"
+        echo "[molley] Pushed build changes to ${BRANCH_NAME}"
+
+        echo "files_changed=${TOTAL_CHANGED}" >> "$GITHUB_OUTPUT"
+        echo "branch_name=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
+
+        # Attempt to create a PR if gh CLI is available
+        if command -v gh >/dev/null 2>&1; then
+          DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "main")
+          EXISTING_PR=$(gh pr list --head "$BRANCH_NAME" --base "$DEFAULT_BRANCH" --state open --json number --jq '.[0].number' 2>/dev/null || true)
+
+          if [ -n "$EXISTING_PR" ] && [ "$EXISTING_PR" != "null" ]; then
+            echo "[molley] PR #${EXISTING_PR} already exists for ${BRANCH_NAME}"
+            PR_URL=$(gh pr view "$EXISTING_PR" --json url --jq '.url' 2>/dev/null || true)
+            echo "pr_number=${EXISTING_PR}" >> "$GITHUB_OUTPUT"
+            echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+          else
+            echo "[molley] Creating PR from ${BRANCH_NAME} → ${DEFAULT_BRANCH}"
+            PR_OUTPUT=$(gh pr create \
+              --base "$DEFAULT_BRANCH" \
+              --head "$BRANCH_NAME" \
+              --title "feat(molley): code writer build" \
+              --body "Automated code changes generated by [Molley Code Writer](https://molley.io)." \
+              2>&1 || true)
+            echo "[molley] PR create output: ${PR_OUTPUT}"
+
+            PR_URL=$(echo "$PR_OUTPUT" | grep -oE 'https://github.com/[^ ]+/pull/[0-9]+' | head -1 || true)
+            PR_NUMBER=$(echo "$PR_URL" | grep -oE '[0-9]+$' || true)
+            if [ -n "$PR_URL" ]; then
+              echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+              echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+              echo "[molley] Created PR #${PR_NUMBER}: ${PR_URL}"
+            fi
+          fi
+        else
+          echo "[molley] gh CLI not available; skipping PR creation"
+        fi
+
     - name: Read git state
       id: git-state
       shell: bash
@@ -304,12 +397,17 @@ runs:
         MOLLEY_MODE: ${{ inputs.mode }}
         ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
         COMMIT_OUTCOME: ${{ steps.commit.outcome }}
+        BUILD_COMMIT_OUTCOME: ${{ steps.build-commit.outcome }}
         RUN_ID: ${{ inputs.run_id }}
         MOLLEY_PROJECT_ID: ${{ inputs.molley_project_id }}
         ANALYSIS_DEPTH: ${{ inputs.analysis_depth }}
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
         WEBHOOK_URL: ${{ inputs.webhook_url }}
         HEAD_SHA: ${{ steps.git-state.outputs.head_sha }}
+        BUILD_FILES_CHANGED: ${{ steps.build-commit.outputs.files_changed }}
+        BUILD_BRANCH_NAME: ${{ steps.build-commit.outputs.branch_name }}
+        BUILD_PR_URL: ${{ steps.build-commit.outputs.pr_url }}
+        BUILD_PR_NUMBER: ${{ steps.build-commit.outputs.pr_number }}
       run: |
         set -euo pipefail
         echo "[molley] Preparing webhook callback — mode: ${MOLLEY_MODE}"
@@ -322,14 +420,18 @@ runs:
             EVENT="analyzer.failed"
             CONCLUSION="failure"
           fi
+        elif [ "$MOLLEY_MODE" = "build" ]; then
+          if [ "$ANALYZE_OUTCOME" = "success" ] && [ "$BUILD_COMMIT_OUTCOME" = "success" ]; then
+            EVENT="build_complete"
+            CONCLUSION="success"
+          else
+            EVENT="failed"
+            CONCLUSION="failure"
+          fi
         else
           if [ "$ANALYZE_OUTCOME" = "success" ]; then
+            EVENT="analysis_complete"
             CONCLUSION="success"
-            if [ "$MOLLEY_MODE" = "analyze" ]; then
-              EVENT="analysis_complete"
-            else
-              EVENT="build_complete"
-            fi
           else
             EVENT="failed"
             CONCLUSION="failure"
@@ -343,7 +445,7 @@ runs:
 
         completed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-        payload=$(EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" MOLLEY_MODE="$MOLLEY_MODE" node -e "
+        payload=$(EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" MOLLEY_MODE="$MOLLEY_MODE" BUILD_FILES_CHANGED="$BUILD_FILES_CHANGED" BUILD_BRANCH_NAME="$BUILD_BRANCH_NAME" BUILD_PR_URL="$BUILD_PR_URL" BUILD_PR_NUMBER="$BUILD_PR_NUMBER" node -e "
           const fs = require('fs');
           const payload = {
             runId: process.env.EFFECTIVE_RUN_ID,
@@ -361,7 +463,7 @@ runs:
             event: process.env.EVENT,
             molleyProjectId: process.env.MOLLEY_PROJECT_ID,
           };
-          if (process.env.MOLLEY_MODE !== 'analyzer') {
+          if (process.env.MOLLEY_MODE === 'analyze') {
             const resultFile = '/tmp/molley-analysis-result.txt';
             try {
               const content = fs.readFileSync(resultFile, 'utf8').slice(0, 102400);
@@ -370,6 +472,12 @@ runs:
                 process.stderr.write('[molley] Including analysis result (' + content.length + ' bytes)\\n');
               }
             } catch {}
+          }
+          if (process.env.MOLLEY_MODE === 'build') {
+            if (process.env.BUILD_FILES_CHANGED) payload.filesChanged = Number(process.env.BUILD_FILES_CHANGED) || 0;
+            if (process.env.BUILD_BRANCH_NAME) payload.branchName = process.env.BUILD_BRANCH_NAME;
+            if (process.env.BUILD_PR_URL) payload.prUrl = process.env.BUILD_PR_URL;
+            if (process.env.BUILD_PR_NUMBER) payload.prNumber = Number(process.env.BUILD_PR_NUMBER) || undefined;
           }
           process.stdout.write(JSON.stringify(payload));
         " )
