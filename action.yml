@@ -29,7 +29,7 @@ inputs:
   webhook_url:
     description: Public Molley webhook URL
     required: false
-    default: https://api.molley.io/public/github/analyzer/webhook
+    default: https://api.molley.io/service/api-tenant/public/github/analyzer/webhook
 
 outputs:
   head_sha:
