@@ -30,6 +30,10 @@ inputs:
     description: Public Molley webhook URL
     required: false
     default: https://api.molley.io/service/api-tenant/public/github/analyzer/webhook
+  mode:
+    description: 'analyzer | analyze | build'
+    required: false
+    default: analyzer
 
 outputs:
   head_sha:
@@ -76,37 +80,66 @@ runs:
       continue-on-error: true
       shell: bash
       env:
+        MOLLEY_MODE: ${{ inputs.mode }}
         ANALYSIS_DEPTH: ${{ inputs.analysis_depth }}
         ANALYZE_DIRECTORIES: ${{ inputs.directories }}
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
       run: |
         set -euo pipefail
-        echo "[molley] Starting repository analysis"
-        echo "[molley] Analysis depth: ${ANALYSIS_DEPTH}"
-        echo "[molley] Focus directories: ${ANALYZE_DIRECTORIES:-<all>}"
-        echo "[molley] Features output: ${FEATURES_FILE_PATH}"
-        mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
+        echo "[molley] Starting Claude Code step — mode: ${MOLLEY_MODE}"
         ANALYZER_FAILED=0
         CLAUDE_MODEL="claude-opus-4-6"
         PROMPT_FILE="$(mktemp)"
-        {
-          printf '%s\n' "Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}."
-          printf '%s\n' "Return markdown only (no prose before/after)."
-          printf '%s\n' "Output one section per feature using: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'."
-          printf '%s\n' "De-duplicate features semantically: if an existing feature represents the same capability, keep one canonical section and do not create a renamed duplicate."
-          printf '%s\n' "Preserve already-known features unless they are clearly incorrect."
-          printf '%s\n' "Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
+        ANALYSIS_RESULT_FILE="/tmp/molley-analysis-result.txt"
 
-          if [ -s "$FEATURES_FILE_PATH" ]; then
-            printf '\n%s\n' "Existing feature baseline from ${FEATURES_FILE_PATH} (treat as already known features):"
-            printf '%s\n' "-----BEGIN EXISTING FEATURES-----"
-            head -c 15000 "$FEATURES_FILE_PATH"
-            printf '%s\n' "-----END EXISTING FEATURES-----"
-            echo "[molley] Seeded analyzer prompt with existing features baseline" >&2
-          else
-            echo "[molley] No existing features baseline found; running full analysis" >&2
+        if [ "$MOLLEY_MODE" = "analyzer" ]; then
+          echo "[molley] Analysis depth: ${ANALYSIS_DEPTH}"
+          echo "[molley] Focus directories: ${ANALYZE_DIRECTORIES:-<all>}"
+          echo "[molley] Features output: ${FEATURES_FILE_PATH}"
+          mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
+          OUTPUT_FILE="$FEATURES_FILE_PATH"
+          {
+            printf '%s\n' "Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}."
+            printf '%s\n' "Return markdown only (no prose before/after)."
+            printf '%s\n' "Output one section per feature using: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'."
+            printf '%s\n' "De-duplicate features semantically: if an existing feature represents the same capability, keep one canonical section and do not create a renamed duplicate."
+            printf '%s\n' "Preserve already-known features unless they are clearly incorrect."
+            printf '%s\n' "Analysis depth: ${ANALYSIS_DEPTH}. Focus directories: ${ANALYZE_DIRECTORIES}."
+
+            if [ -s "$FEATURES_FILE_PATH" ]; then
+              printf '\n%s\n' "Existing feature baseline from ${FEATURES_FILE_PATH} (treat as already known features):"
+              printf '%s\n' "-----BEGIN EXISTING FEATURES-----"
+              head -c 15000 "$FEATURES_FILE_PATH"
+              printf '%s\n' "-----END EXISTING FEATURES-----"
+              echo "[molley] Seeded analyzer prompt with existing features baseline" >&2
+            else
+              echo "[molley] No existing features baseline found; running full analysis" >&2
+            fi
+          } > "$PROMPT_FILE"
+        else
+          OUTPUT_FILE="$ANALYSIS_RESULT_FILE"
+          # For push-triggered runs, github.event.inputs.mode is empty and defaults
+          # to 'build', so we can't rely on MOLLEY_MODE alone. Check both files.
+          REQ_FILE=""
+          if [ -f ".molley/analyze-request.json" ]; then
+            REQ_FILE=".molley/analyze-request.json"
+          elif [ -f ".molley/build-request.json" ]; then
+            REQ_FILE=".molley/build-request.json"
           fi
-        } > "$PROMPT_FILE"
+          if [ -n "$REQ_FILE" ]; then
+            echo "[molley] Reading prompt from ${REQ_FILE}"
+            REQ_FILE="$REQ_FILE" node -e "
+              const fs = require('fs');
+              const req = JSON.parse(fs.readFileSync(process.env.REQ_FILE, 'utf8'));
+              process.stdout.write(req.prompt || '');
+            " > "$PROMPT_FILE"
+          fi
+          if [ ! -s "$PROMPT_FILE" ]; then
+            echo "[molley] No request file or prompt found for mode ${MOLLEY_MODE}"
+            ANALYZER_FAILED=1
+          fi
+        fi
+
         PROMPT="$(cat "$PROMPT_FILE")"
 
         if command -v claude-code >/dev/null 2>&1; then
@@ -139,7 +172,7 @@ runs:
 
           if printf '%s' "$CLI_HELP" | grep -q -- '--print'; then
             echo "[molley] Running analyzer with --print and writing output file"
-            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$FEATURES_FILE_PATH" || ANALYZER_FAILED=1
+            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
           elif printf '%s' "$CLI_HELP" | grep -q -- '--prompt'; then
             echo "[molley] Running analyzer with --prompt"
             if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
@@ -163,38 +196,46 @@ runs:
           ANALYZER_FAILED=1
         fi
 
-        if [ -s "$FEATURES_FILE_PATH" ] && grep -qi 'blocked pending your approval' "$FEATURES_FILE_PATH"; then
-          echo "[molley] Analyzer response indicates permission approval block"
+        if [ -s "$OUTPUT_FILE" ] && grep -qi 'blocked pending your approval' "$OUTPUT_FILE"; then
+          echo "[molley] Claude response indicates permission approval block"
           ANALYZER_FAILED=1
-          rm -f "$FEATURES_FILE_PATH"
+          rm -f "$OUTPUT_FILE"
         fi
 
         rm -f "$PROMPT_FILE"
 
-        if [ ! -s "$FEATURES_FILE_PATH" ]; then
-          echo "[molley] Analyzer did not produce features markdown; writing fallback content"
-          printf '%s\n' \
-            '# Project Features' \
-            '' \
-            '## Codebase Analysis Pending' \
-            '- **Status:** Implemented' \
-            '- **Description:** Analyzer fallback output generated because the AI step did not produce markdown in this run.' \
-            '- **Key Files:** None' \
-            '- **Dependencies:** None' \
-            > "$FEATURES_FILE_PATH"
+        if [ "$MOLLEY_MODE" = "analyzer" ]; then
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            echo "[molley] Analyzer did not produce features markdown; writing fallback content"
+            printf '%s\n' \
+              '# Project Features' \
+              '' \
+              '## Codebase Analysis Pending' \
+              '- **Status:** Implemented' \
+              '- **Description:** Analyzer fallback output generated because the AI step did not produce markdown in this run.' \
+              '- **Key Files:** None' \
+              '- **Dependencies:** None' \
+              > "$OUTPUT_FILE"
+          fi
+          echo "[molley] Features markdown size: $(wc -c < "$OUTPUT_FILE") bytes"
+        else
+          if [ -s "$OUTPUT_FILE" ]; then
+            echo "[molley] Analysis result size: $(wc -c < "$OUTPUT_FILE") bytes"
+          else
+            echo "[molley] No analysis output produced"
+          fi
         fi
 
-        echo "[molley] Features markdown size: $(wc -c < "$FEATURES_FILE_PATH") bytes"
-
         if [ "$ANALYZER_FAILED" -ne 0 ]; then
-          echo "Claude analysis command failed"
+          echo "Claude step failed"
           exit 1
         fi
 
-        echo "[molley] Analyzer command completed successfully"
+        echo "[molley] Claude Code step completed successfully"
 
     - name: Commit analyzer output
       id: commit
+      if: inputs.mode == 'analyzer'
       shell: bash
       env:
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
@@ -260,6 +301,7 @@ runs:
       if: always()
       shell: bash
       env:
+        MOLLEY_MODE: ${{ inputs.mode }}
         ANALYZE_OUTCOME: ${{ steps.analyze.outcome }}
         COMMIT_OUTCOME: ${{ steps.commit.outcome }}
         RUN_ID: ${{ inputs.run_id }}
@@ -270,14 +312,28 @@ runs:
         HEAD_SHA: ${{ steps.git-state.outputs.head_sha }}
       run: |
         set -euo pipefail
-        echo "[molley] Preparing analyzer webhook callback"
+        echo "[molley] Preparing webhook callback — mode: ${MOLLEY_MODE}"
 
-        if [ "$ANALYZE_OUTCOME" = "success" ] && [ "$COMMIT_OUTCOME" = "success" ]; then
-          EVENT="analyzer.completed"
-          CONCLUSION="success"
+        if [ "$MOLLEY_MODE" = "analyzer" ]; then
+          if [ "$ANALYZE_OUTCOME" = "success" ] && [ "$COMMIT_OUTCOME" = "success" ]; then
+            EVENT="analyzer.completed"
+            CONCLUSION="success"
+          else
+            EVENT="analyzer.failed"
+            CONCLUSION="failure"
+          fi
         else
-          EVENT="analyzer.failed"
-          CONCLUSION="failure"
+          if [ "$ANALYZE_OUTCOME" = "success" ]; then
+            CONCLUSION="success"
+            if [ "$MOLLEY_MODE" = "analyze" ]; then
+              EVENT="analysis_complete"
+            else
+              EVENT="build_complete"
+            fi
+          else
+            EVENT="failed"
+            CONCLUSION="failure"
+          fi
         fi
 
         EFFECTIVE_RUN_ID="$RUN_ID"
@@ -286,7 +342,9 @@ runs:
         fi
 
         completed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-        payload=$(EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" node -e "
+
+        payload=$(EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" MOLLEY_MODE="$MOLLEY_MODE" node -e "
+          const fs = require('fs');
           const payload = {
             runId: process.env.EFFECTIVE_RUN_ID,
             workflowRunId: Number(process.env.GITHUB_RUN_ID),
@@ -303,6 +361,16 @@ runs:
             event: process.env.EVENT,
             molleyProjectId: process.env.MOLLEY_PROJECT_ID,
           };
+          if (process.env.MOLLEY_MODE !== 'analyzer') {
+            const resultFile = '/tmp/molley-analysis-result.txt';
+            try {
+              const content = fs.readFileSync(resultFile, 'utf8').slice(0, 102400);
+              if (content) {
+                payload.analysisResult = content;
+                process.stderr.write('[molley] Including analysis result (' + content.length + ' bytes)\\n');
+              }
+            } catch {}
+          }
           process.stdout.write(JSON.stringify(payload));
         " )
 
