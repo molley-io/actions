@@ -26,6 +26,10 @@ inputs:
     description: Path to features markdown in the target repository
     required: false
     default: .molley/features.md
+  architecture_diagram_path:
+    description: Path to the Excalidraw architecture diagram JSON in the target repository
+    required: false
+    default: .molley/architecture.excalidraw
   webhook_url:
     description: Public Molley webhook URL
     required: false
@@ -42,6 +46,9 @@ outputs:
   features_file_path:
     description: Resolved output features file path
     value: ${{ inputs.features_file_path }}
+  architecture_diagram_path:
+    description: Resolved output architecture diagram path
+    value: ${{ inputs.architecture_diagram_path }}
 
 runs:
   using: composite
@@ -258,6 +265,103 @@ runs:
 
         echo "[molley] Claude Code step completed successfully"
 
+    - name: Generate architecture diagram with Claude Code
+      id: architecture
+      if: inputs.mode == 'analyzer' && steps.analyze.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      env:
+        ARCHITECTURE_DIAGRAM_PATH: ${{ inputs.architecture_diagram_path }}
+        FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
+      run: |
+        set -euo pipefail
+        echo "[molley] Generating architecture diagram"
+        mkdir -p "$(dirname "$ARCHITECTURE_DIAGRAM_PATH")"
+        ARCH_PROMPT_FILE="$(mktemp)"
+
+        {
+          printf '%s\n' "Analyze this repository and produce an Excalidraw JSON diagram representing the product's technical architecture."
+          printf '%s\n' "Return ONLY valid JSON (no markdown fences, no prose before/after)."
+          printf '%s\n' "The JSON must be a valid Excalidraw scene with this structure: { \"type\": \"excalidraw\", \"version\": 2, \"elements\": [...], \"appState\": { \"viewBackgroundColor\": \"#ffffff\" } }"
+          printf '%s\n' "Show the main services, databases, APIs, frontends, and external integrations as rectangles with descriptive text labels."
+          printf '%s\n' "Connect them with arrows showing data flow and dependencies."
+          printf '%s\n' "Use a clean left-to-right or top-to-bottom layout."
+          printf '%s\n' "Use these Excalidraw element types: rectangle, text, arrow, line."
+          printf '%s\n' "Each element needs: id, type, x, y, width, height, strokeColor, backgroundColor, fillStyle, strokeWidth, and type-specific properties."
+          printf '%s\n' "For text elements include: text, fontSize (16-20), fontFamily (1 for Virgil)."
+          printf '%s\n' "For arrows include: points array, startBinding/endBinding with elementId references."
+          if [ -s "$FEATURES_FILE_PATH" ]; then
+            printf '\n%s\n' "Use the features from ${FEATURES_FILE_PATH} to inform the architecture:"
+            head -c 10000 "$FEATURES_FILE_PATH"
+          fi
+          if [ -s "$ARCHITECTURE_DIAGRAM_PATH" ]; then
+            printf '\n%s\n' "Existing architecture diagram to update and improve:"
+            head -c 50000 "$ARCHITECTURE_DIAGRAM_PATH"
+          fi
+        } > "$ARCH_PROMPT_FILE"
+
+        ARCH_PROMPT="$(cat "$ARCH_PROMPT_FILE")"
+
+        if command -v claude-code >/dev/null 2>&1; then
+          CLAUDE_BIN="claude-code"
+        elif command -v claude >/dev/null 2>&1; then
+          CLAUDE_BIN="claude"
+        else
+          CLAUDE_BIN=""
+        fi
+
+        ARCH_FAILED=0
+        CLAUDE_MODEL="claude-sonnet-4-20250514"
+        if [ -n "$CLAUDE_BIN" ]; then
+          CLI_HELP="$($CLAUDE_BIN --help 2>&1 || true)"
+          MODEL_ARGS=()
+          if printf '%s' "$CLI_HELP" | grep -q -- '--model'; then
+            MODEL_ARGS=(--model "$CLAUDE_MODEL")
+          fi
+          HAS_PRINT=0
+          printf '%s' "$CLI_HELP" | grep -q -- '--print' && HAS_PRINT=1
+
+          if [ "$HAS_PRINT" = "1" ]; then
+            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$ARCH_PROMPT" > "$ARCHITECTURE_DIAGRAM_PATH" || ARCH_FAILED=1
+          else
+            "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$ARCH_PROMPT" > "$ARCHITECTURE_DIAGRAM_PATH" || ARCH_FAILED=1
+          fi
+        else
+          ARCH_FAILED=1
+        fi
+
+        rm -f "$ARCH_PROMPT_FILE"
+
+        if [ "$ARCH_FAILED" -ne 0 ] || [ ! -s "$ARCHITECTURE_DIAGRAM_PATH" ]; then
+          echo "[molley] Architecture diagram generation failed or empty; skipping"
+          rm -f "$ARCHITECTURE_DIAGRAM_PATH"
+          exit 0
+        fi
+
+        # Validate JSON
+        if ! node -e "JSON.parse(require('fs').readFileSync(process.env.ARCHITECTURE_DIAGRAM_PATH, 'utf8'))" 2>/dev/null; then
+          echo "[molley] Architecture diagram output is not valid JSON; attempting to extract JSON"
+          node -e "
+            const fs = require('fs');
+            const raw = fs.readFileSync(process.env.ARCHITECTURE_DIAGRAM_PATH, 'utf8');
+            const match = raw.match(/\\{[\\s\\S]*\\}/); 
+            if (match) {
+              JSON.parse(match[0]);
+              fs.writeFileSync(process.env.ARCHITECTURE_DIAGRAM_PATH, match[0]);
+              process.stderr.write('[molley] Extracted valid JSON from output\n');
+            } else {
+              process.stderr.write('[molley] Could not extract valid JSON; removing file\n');
+              fs.unlinkSync(process.env.ARCHITECTURE_DIAGRAM_PATH);
+            }
+          " 2>&1 || rm -f "$ARCHITECTURE_DIAGRAM_PATH"
+        fi
+
+        if [ -s "$ARCHITECTURE_DIAGRAM_PATH" ]; then
+          echo "[molley] Architecture diagram size: $(wc -c < "$ARCHITECTURE_DIAGRAM_PATH") bytes"
+        else
+          echo "[molley] No valid architecture diagram produced"
+        fi
+
     - name: Commit analyzer output
       id: commit
       if: inputs.mode == 'analyzer'
@@ -270,9 +374,16 @@ runs:
         git config user.name "molley-bot"
         git config user.email "actions@users.noreply.github.com"
 
+        ARCHITECTURE_DIAGRAM_PATH="${{ inputs.architecture_diagram_path }}"
         target_branch="${GITHUB_REF_NAME:-main}"
         snapshot_file="$(mktemp)"
         cp "$FEATURES_FILE_PATH" "$snapshot_file"
+        arch_snapshot_file="$(mktemp)"
+        HAS_ARCH="false"
+        if [ -s "$ARCHITECTURE_DIAGRAM_PATH" ]; then
+          cp "$ARCHITECTURE_DIAGRAM_PATH" "$arch_snapshot_file"
+          HAS_ARCH="true"
+        fi
 
         pushed="false"
         changed="false"
@@ -284,8 +395,15 @@ runs:
 
           mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
           cp "$snapshot_file" "$FEATURES_FILE_PATH"
+          if [ "$HAS_ARCH" = "true" ]; then
+            mkdir -p "$(dirname "$ARCHITECTURE_DIAGRAM_PATH")"
+            cp "$arch_snapshot_file" "$ARCHITECTURE_DIAGRAM_PATH"
+          fi
 
           git add "$FEATURES_FILE_PATH"
+          if [ "$HAS_ARCH" = "true" ]; then
+            git add "$ARCHITECTURE_DIAGRAM_PATH"
+          fi
           if git diff --cached --quiet; then
             echo "[molley] No changes to commit after syncing with origin/${target_branch}"
             changed="false"
@@ -305,7 +423,7 @@ runs:
           echo "[molley] Push failed due to branch movement; retrying"
         done
 
-        rm -f "$snapshot_file"
+        rm -f "$snapshot_file" "$arch_snapshot_file"
 
         if [ "$pushed" != "true" ]; then
           echo "[molley] Failed to push analyzer output after retries"
@@ -402,6 +520,7 @@ runs:
         MOLLEY_PROJECT_ID: ${{ inputs.molley_project_id }}
         ANALYSIS_DEPTH: ${{ inputs.analysis_depth }}
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
+        ARCHITECTURE_DIAGRAM_PATH: ${{ inputs.architecture_diagram_path }}
         WEBHOOK_URL: ${{ inputs.webhook_url }}
         HEAD_SHA: ${{ steps.git-state.outputs.head_sha }}
         BUILD_FILES_CHANGED: ${{ steps.build-commit.outputs.files_changed }}
@@ -463,6 +582,17 @@ runs:
             event: process.env.EVENT,
             molleyProjectId: process.env.MOLLEY_PROJECT_ID,
           };
+          if (process.env.MOLLEY_MODE === 'analyzer') {
+            try {
+              const archPath = process.env.ARCHITECTURE_DIAGRAM_PATH;
+              const archContent = fs.readFileSync(archPath, 'utf8');
+              if (archContent) {
+                JSON.parse(archContent);
+                payload.architectureDiagram = archContent;
+                process.stderr.write('[molley] Including architecture diagram (' + archContent.length + ' bytes)\n');
+              }
+            } catch {}
+          }
           if (process.env.MOLLEY_MODE === 'analyze') {
             const resultFile = '/tmp/molley-analysis-result.txt';
             try {
