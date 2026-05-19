@@ -676,6 +676,13 @@ runs:
           };
           if (process.env.MOLLEY_MODE === 'analyzer') {
             try {
+              const featuresContent = fs.readFileSync(process.env.FEATURES_FILE_PATH, 'utf8');
+              if (featuresContent) {
+                payload.featuresMarkdown = featuresContent;
+                process.stderr.write('[molley] Including features markdown (' + featuresContent.length + ' bytes)\n');
+              }
+            } catch {}
+            try {
               const archPath = process.env.ARCHITECTURE_DIAGRAM_PATH;
               const archContent = fs.readFileSync(archPath, 'utf8');
               if (archContent) {
