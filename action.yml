@@ -82,6 +82,76 @@ runs:
         echo "[molley] Node version: $(node --version)"
         echo "[molley] npm version: $(npm --version)"
 
+    - name: Setup Molley MCP Server for product context
+      id: mcp-setup
+      continue-on-error: true
+      shell: bash
+      env:
+        MOLLEY_API_KEY: ${{ env.MOLLEY_API_KEY }}
+        MOLLEY_COMPANY_ID: ${{ env.MOLLEY_COMPANY_ID }}
+        MOLLEY_PROJECT_PASSPORT: ${{ inputs.molley_project_id }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${MOLLEY_API_KEY:-}" ]; then
+          echo "[molley] MOLLEY_API_KEY not set — skipping MCP server setup (product context will not be available)"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        RESOLVED_COMPANY_ID="${MOLLEY_COMPANY_ID:-}"
+        RESOLVED_PROJECT_ID=""
+
+        if [ -n "${MOLLEY_PROJECT_PASSPORT:-}" ]; then
+          DECODED=$(node -e "
+            const passport = process.env.MOLLEY_PROJECT_PASSPORT || '';
+            const encoded = passport.split('.')[0] || '';
+            try {
+              const json = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+              process.stdout.write(JSON.stringify(json));
+            } catch { process.stdout.write('{}'); }
+          " 2>/dev/null || echo '{}')
+
+          PASSPORT_COMPANY=$(echo "$DECODED" | node -e "const d=require('fs').readFileSync(0,'utf8');try{process.stdout.write(JSON.parse(d).companyId||'')}catch{}" 2>/dev/null || true)
+          PASSPORT_PROJECT=$(echo "$DECODED" | node -e "const d=require('fs').readFileSync(0,'utf8');try{process.stdout.write(JSON.parse(d).projectId||'')}catch{}" 2>/dev/null || true)
+
+          if [ -z "$RESOLVED_COMPANY_ID" ] && [ -n "$PASSPORT_COMPANY" ]; then
+            RESOLVED_COMPANY_ID="$PASSPORT_COMPANY"
+          fi
+          if [ -n "$PASSPORT_PROJECT" ]; then
+            RESOLVED_PROJECT_ID="$PASSPORT_PROJECT"
+          fi
+        fi
+
+        if [ -z "$RESOLVED_COMPANY_ID" ]; then
+          echo "[molley] Cannot resolve company ID — skipping MCP server setup"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "[molley] Installing Molley MCP server"
+        npm install -g @molley/mcp-server
+
+        echo "[molley] Configuring MCP server credentials"
+        npx @molley/mcp-server login --api-key "$MOLLEY_API_KEY" --company-id "$RESOLVED_COMPANY_ID"
+
+        if command -v claude-code >/dev/null 2>&1; then
+          CLAUDE_BIN="claude-code"
+        elif command -v claude >/dev/null 2>&1; then
+          CLAUDE_BIN="claude"
+        else
+          echo "[molley] Claude CLI not found — skipping MCP registration"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "[molley] Registering MCP server with Claude Code"
+        "$CLAUDE_BIN" mcp add molley -- npx @molley/mcp-server
+
+        echo "mcp_available=true" >> "$GITHUB_OUTPUT"
+        echo "project_id=${RESOLVED_PROJECT_ID}" >> "$GITHUB_OUTPUT"
+        echo "[molley] MCP server configured — product context will be available during analysis"
+
     - name: Generate features markdown with Claude Code
       id: analyze
       continue-on-error: true
@@ -91,6 +161,8 @@ runs:
         ANALYSIS_DEPTH: ${{ inputs.analysis_depth }}
         ANALYZE_DIRECTORIES: ${{ inputs.directories }}
         FEATURES_FILE_PATH: ${{ inputs.features_file_path }}
+        MCP_AVAILABLE: ${{ steps.mcp-setup.outputs.mcp_available }}
+        MCP_PROJECT_ID: ${{ steps.mcp-setup.outputs.project_id }}
       run: |
         set -euo pipefail
         echo "[molley] Starting Claude Code step — mode: ${MOLLEY_MODE}"
@@ -106,6 +178,16 @@ runs:
           mkdir -p "$(dirname "$FEATURES_FILE_PATH")"
           OUTPUT_FILE="$FEATURES_FILE_PATH"
           {
+            if [ "${MCP_AVAILABLE:-false}" = "true" ] && [ -n "${MCP_PROJECT_ID:-}" ]; then
+              printf '%s\n' "IMPORTANT: Before analyzing code, use the Molley MCP server to understand the full product context."
+              printf '%s\n' "Call the get_analyzer_context tool with projectId '${MCP_PROJECT_ID}' to retrieve:"
+              printf '%s\n' "- The product description, market understanding, business model, and go-to-market strategy"
+              printf '%s\n' "- All features/ideas already tracked in Molley with their status and priority"
+              printf '%s\n' "- Product wiki note titles (use get_note if any seem relevant to the analysis)"
+              printf '%s\n' "Use this product context to inform your analysis. This repository may be ONE of several repositories that make up the product (poly-repo). Do not duplicate features already tracked — only add new ones, update changed ones, or flag removed ones."
+              printf '%s\n' ""
+            fi
+
             printf '%s\n' "Analyze this repository and produce markdown content for ${FEATURES_FILE_PATH}."
             printf '%s\n' "Return markdown only (no prose before/after)."
             printf '%s\n' "Output one section per feature using: '## <Feature Name>' then bullets for '**Status:**', '**Description:**', '**Key Files:**', and '**Dependencies:**'."
@@ -199,8 +281,17 @@ runs:
             else
               "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
             fi
+          elif [ "${MCP_AVAILABLE:-false}" = "true" ] && [ "$HAS_PROMPT" = "1" ]; then
+            # MCP available: use --prompt so Claude can call MCP tools for product context
+            # Claude will write the output file directly via tool use
+            echo "[molley] Running with --prompt (MCP product context enabled)"
+            if [ "$HAS_SKIP_PERMS" = "1" ]; then
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
+            else
+              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
+            fi
           else
-            # Analyzer / Analyze mode: capture text output only via --print
+            # Analyzer / Analyze mode without MCP: capture text output only via --print
             if [ "$HAS_PRINT" = "1" ]; then
               echo "[molley] Running with --print and writing output file"
               "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
@@ -564,7 +655,8 @@ runs:
 
         completed_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-        payload=$(EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" MOLLEY_MODE="$MOLLEY_MODE" BUILD_FILES_CHANGED="$BUILD_FILES_CHANGED" BUILD_BRANCH_NAME="$BUILD_BRANCH_NAME" BUILD_PR_URL="$BUILD_PR_URL" BUILD_PR_NUMBER="$BUILD_PR_NUMBER" node -e "
+        PAYLOAD_FILE="$(mktemp)"
+        EFFECTIVE_RUN_ID="$EFFECTIVE_RUN_ID" CONCLUSION="$CONCLUSION" EVENT="$EVENT" COMPLETED_AT="$completed_at" MOLLEY_MODE="$MOLLEY_MODE" BUILD_FILES_CHANGED="$BUILD_FILES_CHANGED" BUILD_BRANCH_NAME="$BUILD_BRANCH_NAME" BUILD_PR_URL="$BUILD_PR_URL" BUILD_PR_NUMBER="$BUILD_PR_NUMBER" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
           const fs = require('fs');
           const payload = {
             runId: process.env.EFFECTIVE_RUN_ID,
@@ -609,8 +701,8 @@ runs:
             if (process.env.BUILD_PR_URL) payload.prUrl = process.env.BUILD_PR_URL;
             if (process.env.BUILD_PR_NUMBER) payload.prNumber = Number(process.env.BUILD_PR_NUMBER) || undefined;
           }
-          process.stdout.write(JSON.stringify(payload));
-        " )
+          fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+        "
 
         curl_headers=(
           -H 'content-type: application/json'
@@ -619,7 +711,7 @@ runs:
         )
 
         if [ -n "${MOLLEY_WEBHOOK_SECRET:-}" ]; then
-          signature=$(printf '%s' "$payload" | openssl dgst -sha256 -hmac "$MOLLEY_WEBHOOK_SECRET" | sed 's/^.* //')
+          signature=$(openssl dgst -sha256 -hmac "$MOLLEY_WEBHOOK_SECRET" "$PAYLOAD_FILE" | sed 's/^.* //')
           curl_headers+=( -H "x-molley-signature: sha256=${signature}" )
         fi
 
@@ -629,6 +721,7 @@ runs:
         curl --fail --silent --show-error \
           -X POST "$WEBHOOK_URL" \
           "${curl_headers[@]}" \
-          --data "$payload"
+          --data-binary @"$PAYLOAD_FILE"
 
+        rm -f "$PAYLOAD_FILE"
         echo "[molley] Webhook callback delivered"
