@@ -259,58 +259,38 @@ runs:
           heartbeat &
           HEARTBEAT_PID=$!
 
+          # The Claude Code CLI takes the prompt as a POSITIONAL argument and runs
+          # non-interactively via -p/--print. There is NO --prompt flag (it was
+          # never one; older detection that grepped for "--prompt" matched a
+          # substring in --help and passed an invalid flag). Tool use — including
+          # the Molley MCP server and file writes — works in print mode, so a
+          # single invocation covers analyzer, MCP and build modes. We add
+          # --dangerously-skip-permissions so tool calls and file writes are
+          # allowed without an interactive approval prompt in CI.
           HAS_PRINT=0
-          HAS_PROMPT=0
           HAS_SKIP_PERMS=0
           printf '%s' "$CLI_HELP" | grep -q -- '--print' && HAS_PRINT=1
-          printf '%s' "$CLI_HELP" | grep -q -- '--prompt' && HAS_PROMPT=1
           printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions' && HAS_SKIP_PERMS=1
 
-          if [ "$MOLLEY_MODE" = "build" ]; then
-            # Build mode: Claude must write files, so use --prompt (not --print)
-            # and --dangerously-skip-permissions to allow file writes in CI
-            echo "[molley] Build mode — using interactive prompt with file-write permissions"
-            if [ "$HAS_PROMPT" = "1" ]; then
-              if [ "$HAS_SKIP_PERMS" = "1" ]; then
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
-              else
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
-              fi
-            elif [ "$HAS_SKIP_PERMS" = "1" ]; then
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
-            else
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
-            fi
-          elif [ "${MCP_AVAILABLE:-false}" = "true" ] && [ "$HAS_PROMPT" = "1" ]; then
-            # MCP available: use --prompt so Claude can call MCP tools for product context
-            # Claude will write the output file directly via tool use
-            echo "[molley] Running with --prompt (MCP product context enabled)"
-            if [ "$HAS_SKIP_PERMS" = "1" ]; then
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
-            else
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
-            fi
-          else
-            # Analyzer / Analyze mode without MCP: capture text output only via --print
-            if [ "$HAS_PRINT" = "1" ]; then
-              echo "[molley] Running with --print and writing output file"
-              "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --print "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
-            elif [ "$HAS_PROMPT" = "1" ]; then
-              echo "[molley] Running with --prompt"
-              if [ "$HAS_SKIP_PERMS" = "1" ]; then
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions --prompt "$PROMPT" || ANALYZER_FAILED=1
-              else
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --prompt "$PROMPT" || ANALYZER_FAILED=1
-              fi
-            else
-              echo "[molley] Running with positional prompt"
-              if [ "$HAS_SKIP_PERMS" = "1" ]; then
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" --dangerously-skip-permissions "$PROMPT" || ANALYZER_FAILED=1
-              else
-                "$CLAUDE_BIN" "${MODEL_ARGS[@]}" "$PROMPT" || ANALYZER_FAILED=1
-              fi
-            fi
+          RUN_ARGS=("${MODEL_ARGS[@]}")
+          if [ "$HAS_SKIP_PERMS" = "1" ]; then
+            RUN_ARGS+=(--dangerously-skip-permissions)
           fi
+          if [ "$HAS_PRINT" = "1" ]; then
+            RUN_ARGS+=(--print)
+          else
+            echo "[molley] CLI does not advertise --print; running with positional prompt only"
+          fi
+
+          if [ "$MOLLEY_MODE" = "build" ]; then
+            echo "[molley] Build mode — headless run with file-write permissions"
+          elif [ "${MCP_AVAILABLE:-false}" = "true" ]; then
+            echo "[molley] Running headless (MCP product context enabled)"
+          else
+            echo "[molley] Running headless analysis"
+          fi
+
+          "$CLAUDE_BIN" "${RUN_ARGS[@]}" "$PROMPT" > "$OUTPUT_FILE" || ANALYZER_FAILED=1
 
           kill "$HEARTBEAT_PID" 2>/dev/null || true
           wait "$HEARTBEAT_PID" 2>/dev/null || true
