@@ -5,9 +5,17 @@ author: Molley
 
 inputs:
   report_style:
-    description: 'Report audience/style: slt | sales | developer'
+    description: 'Report audience/style: slt | sales | developer. Ignored when routes is set.'
     required: false
     default: developer
+  routes:
+    description: >-
+      Multi-report routing: one line per report as '<style>: <platform>:<ENV_VAR>, <platform>:<ENV_VAR>, ...'
+      where platform is slack | teams | gchat and ENV_VAR names an env var holding that webhook URL.
+      Example: 'slt: slack:SLACK_URL_A, slack:SLACK_URL_B' + newline + 'developer: slack:SLACK_URL_DEV'.
+      When set, every listed style is generated and committed in one run and delivered to its own destinations.
+    required: false
+    default: ''
   days:
     description: Look-back window in days (max 14 — limited by the Molley activity API)
     required: false
@@ -29,11 +37,11 @@ inputs:
     default: claude-opus-4-6
 
 outputs:
-  report_path:
-    description: Repository-relative path of the committed report
-    value: ${{ steps.commit.outputs.report_path }}
+  report_paths:
+    description: Space-separated repository-relative paths of the committed report(s)
+    value: ${{ steps.commit.outputs.report_paths }}
   report_branch:
-    description: Branch the report was committed to
+    description: Branch the report(s) were committed to
     value: ${{ steps.commit.outputs.report_branch }}
 
 runs:
@@ -53,6 +61,7 @@ runs:
       shell: bash
       env:
         REPORT_STYLE: ${{ inputs.report_style }}
+        ROUTES: ${{ inputs.routes }}
       run: |
         set -euo pipefail
         echo "[molley] Validating required environment"
@@ -60,15 +69,42 @@ runs:
           echo "ANTHROPIC_API_KEY is required"
           exit 1
         fi
-        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
-        case "$STYLE" in
-          slt|sales|developer) ;;
-          *)
-            echo "Invalid report_style '${REPORT_STYLE}' — must be one of: slt, sales, developer"
-            exit 1
-            ;;
-        esac
-        echo "[molley] ANTHROPIC_API_KEY is present, report style: ${STYLE}"
+
+        if [ -n "${ROUTES:-}" ]; then
+          node -e "
+            const validStyles = ['slt', 'sales', 'developer'];
+            const validPlatforms = ['slack', 'teams', 'gchat'];
+            for (const line of (process.env.ROUTES || '').split('\n')) {
+              const t = line.trim();
+              if (!t) continue;
+              const i = t.indexOf(':');
+              if (i < 1) { console.error('Invalid routes line (expected \"style: platform:ENV_VAR, ...\"): ' + t); process.exit(1); }
+              const style = t.slice(0, i).trim().toLowerCase();
+              if (!validStyles.includes(style)) { console.error('Invalid style in routes: \"' + style + '\" — must be one of: ' + validStyles.join(', ')); process.exit(1); }
+              for (const d of t.slice(i + 1).split(',')) {
+                const dt = d.trim();
+                if (!dt) continue;
+                const j = dt.indexOf(':');
+                const platform = j < 0 ? dt : dt.slice(0, j).trim().toLowerCase();
+                const envName = j < 0 ? '' : dt.slice(j + 1).trim();
+                if (!validPlatforms.includes(platform)) { console.error('Invalid destination \"' + dt + '\" — use slack:ENV_VAR, teams:ENV_VAR or gchat:ENV_VAR'); process.exit(1); }
+                if (!/^[A-Za-z_][A-Za-z0-9_]*\$/.test(envName)) { console.error('Invalid env var name in destination \"' + dt + '\"'); process.exit(1); }
+              }
+            }
+            console.log('[molley] routes input is valid');
+          "
+        else
+          STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+          case "$STYLE" in
+            slt|sales|developer) ;;
+            *)
+              echo "Invalid report_style '${REPORT_STYLE}' — must be one of: slt, sales, developer"
+              exit 1
+              ;;
+          esac
+          echo "[molley] Report style: ${STYLE}"
+        fi
+        echo "[molley] Environment is valid"
 
     - name: Install Claude Code CLI
       shell: bash
@@ -185,11 +221,12 @@ runs:
         echo "[molley] Digest size: $(wc -c < "$DIGEST_FILE") bytes"
         echo "digest_file=${DIGEST_FILE}" >> "$GITHUB_OUTPUT"
 
-    - name: Generate report with Claude Code
+    - name: Generate report(s) with Claude Code
       id: report
       shell: bash
       env:
         REPORT_STYLE: ${{ inputs.report_style }}
+        ROUTES: ${{ inputs.routes }}
         DAYS: ${{ inputs.days }}
         CLAUDE_MODEL: ${{ inputs.model }}
         MCP_AVAILABLE: ${{ steps.mcp-setup.outputs.mcp_available }}
@@ -197,14 +234,27 @@ runs:
         DIGEST_FILE: ${{ steps.git-digest.outputs.digest_file }}
       run: |
         set -euo pipefail
-        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
-        echo "[molley] Generating ${STYLE} report covering the last ${DAYS} days"
 
-        PROMPT_FILE="$(mktemp)"
-        OUTPUT_FILE="/tmp/molley-progress-report.md"
-        REPORT_FAILED=0
+        if [ -n "${ROUTES:-}" ]; then
+          STYLES="$(node -e "
+            const styles = [];
+            for (const line of (process.env.ROUTES || '').split('\n')) {
+              const t = line.trim();
+              if (!t) continue;
+              const style = t.slice(0, t.indexOf(':')).trim().toLowerCase();
+              if (style && !styles.includes(style)) styles.push(style);
+            }
+            process.stdout.write(styles.join(' '));
+          ")"
+        else
+          STYLES="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+        fi
+        echo "[molley] Report styles to generate: ${STYLES} (last ${DAYS} days each)"
 
-        {
+        build_prompt() {
+          local STYLE="$1"
+          local PROMPT_FILE="$2"
+          {
           printf '%s\n' "You are writing a periodic product progress report covering the last ${DAYS} days for the repository you are running in (a monorepo — treat top-level directories/workspaces as product areas)."
           printf '%s\n' ""
           printf '%s\n' "NON-NEGOTIABLE RULES:"
@@ -263,9 +313,8 @@ runs:
           printf '%s\n' "-----BEGIN GIT DIGEST-----"
           head -c 40000 "$DIGEST_FILE"
           printf '\n%s\n' "-----END GIT DIGEST-----"
-        } > "$PROMPT_FILE"
-
-        PROMPT="$(cat "$PROMPT_FILE")"
+          } > "$PROMPT_FILE"
+        }
 
         if command -v claude-code >/dev/null 2>&1; then
           CLAUDE_BIN="claude-code"
@@ -298,42 +347,56 @@ runs:
         heartbeat &
         HEARTBEAT_PID=$!
 
-        "$CLAUDE_BIN" "${RUN_ARGS[@]}" "$PROMPT" > "$OUTPUT_FILE" || REPORT_FAILED=1
+        GENERATED_STYLES=""
+        for STYLE in $STYLES; do
+          echo "[molley] Generating ${STYLE} report"
+          PROMPT_FILE="$(mktemp)"
+          OUTPUT_FILE="/tmp/molley-progress-report-${STYLE}.md"
+          build_prompt "$STYLE" "$PROMPT_FILE"
+
+          STYLE_FAILED=0
+          "$CLAUDE_BIN" "${RUN_ARGS[@]}" "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE" || STYLE_FAILED=1
+          rm -f "$PROMPT_FILE"
+
+          # Strip a wrapping markdown fence if the model added one despite instructions
+          if [ -s "$OUTPUT_FILE" ]; then
+            OUTPUT_FILE="$OUTPUT_FILE" node -e "
+              const fs = require('fs');
+              const p = process.env.OUTPUT_FILE;
+              let t = fs.readFileSync(p, 'utf8').trim();
+              const m = t.match(/^\`\`\`(?:markdown|md)?\n([\s\S]*)\n\`\`\`\$/);
+              if (m) fs.writeFileSync(p, m[1] + '\n');
+            "
+          fi
+
+          if [ "$STYLE_FAILED" -ne 0 ] || [ ! -s "$OUTPUT_FILE" ] || [ "$(wc -c < "$OUTPUT_FILE")" -lt 200 ]; then
+            echo "[molley] ${STYLE} report generation failed or produced no usable output"
+          else
+            echo "[molley] ${STYLE} report size: $(wc -c < "$OUTPUT_FILE") bytes"
+            GENERATED_STYLES="${GENERATED_STYLES}${GENERATED_STYLES:+ }${STYLE}"
+          fi
+        done
 
         kill "$HEARTBEAT_PID" 2>/dev/null || true
         wait "$HEARTBEAT_PID" 2>/dev/null || true
-        rm -f "$PROMPT_FILE"
 
-        # Strip a wrapping markdown fence if the model added one despite instructions
-        if [ -s "$OUTPUT_FILE" ]; then
-          OUTPUT_FILE="$OUTPUT_FILE" node -e "
-            const fs = require('fs');
-            const p = process.env.OUTPUT_FILE;
-            let t = fs.readFileSync(p, 'utf8').trim();
-            const m = t.match(/^\`\`\`(?:markdown|md)?\n([\s\S]*)\n\`\`\`\$/);
-            if (m) fs.writeFileSync(p, m[1] + '\n');
-          "
-        fi
-
-        if [ "$REPORT_FAILED" -ne 0 ] || [ ! -s "$OUTPUT_FILE" ] || [ "$(wc -c < "$OUTPUT_FILE")" -lt 200 ]; then
-          echo "[molley] Report generation failed or produced no usable output"
+        if [ -z "$GENERATED_STYLES" ]; then
+          echo "[molley] All report generations failed"
           exit 1
         fi
 
-        echo "[molley] Report size: $(wc -c < "$OUTPUT_FILE") bytes"
-        echo "report_file=${OUTPUT_FILE}" >> "$GITHUB_OUTPUT"
+        echo "generated_styles=${GENERATED_STYLES}" >> "$GITHUB_OUTPUT"
+        echo "[molley] Generated styles: ${GENERATED_STYLES}"
 
-    - name: Commit report
+    - name: Commit report(s)
       id: commit
       shell: bash
       env:
-        REPORT_STYLE: ${{ inputs.report_style }}
         REPORTS_DIR: ${{ inputs.reports_dir }}
         OUTPUT_BRANCH: ${{ inputs.output_branch }}
-        REPORT_FILE: ${{ steps.report.outputs.report_file }}
+        GENERATED_STYLES: ${{ steps.report.outputs.generated_styles }}
       run: |
         set -euo pipefail
-        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
         git config user.name "molley-bot"
         git config user.email "actions@users.noreply.github.com"
 
@@ -349,7 +412,6 @@ runs:
         echo "[molley] Target branch: ${target_branch}"
 
         STAMP="$(date -u +"%Y-%m-%d-%H%MZ")"
-        REPORT_PATH="${REPORTS_DIR}/${STAMP}-${STYLE}.md"
 
         pushed="false"
         for attempt in 1 2 3; do
@@ -357,14 +419,18 @@ runs:
           git fetch origin "$target_branch"
           git checkout -B "molley-report-${GITHUB_RUN_ID:-local}" "origin/$target_branch"
 
-          mkdir -p "$(dirname "$REPORT_PATH")"
-          cp "$REPORT_FILE" "$REPORT_PATH"
-
-          git add "$REPORT_PATH"
-          git commit -m "docs(molley): ${STYLE} progress report ${STAMP}"
+          mkdir -p "$REPORTS_DIR"
+          REPORT_PATHS=""
+          for STYLE in $GENERATED_STYLES; do
+            REPORT_PATH="${REPORTS_DIR}/${STAMP}-${STYLE}.md"
+            cp "/tmp/molley-progress-report-${STYLE}.md" "$REPORT_PATH"
+            git add "$REPORT_PATH"
+            REPORT_PATHS="${REPORT_PATHS}${REPORT_PATHS:+ }${REPORT_PATH}"
+          done
+          git commit -m "docs(molley): progress report(s) ${STAMP} [${GENERATED_STYLES}]"
 
           if git push origin "HEAD:${target_branch}"; then
-            echo "[molley] Report pushed to ${target_branch}"
+            echo "[molley] Report(s) pushed to ${target_branch}"
             pushed="true"
             break
           fi
@@ -373,23 +439,25 @@ runs:
         done
 
         if [ "$pushed" != "true" ]; then
-          echo "[molley] Failed to push report after retries"
+          echo "[molley] Failed to push report(s) after retries"
           exit 1
         fi
 
-        echo "report_path=${REPORT_PATH}" >> "$GITHUB_OUTPUT"
+        echo "report_paths=${REPORT_PATHS}" >> "$GITHUB_OUTPUT"
+        echo "report_stamp=${STAMP}" >> "$GITHUB_OUTPUT"
         echo "report_branch=${target_branch}" >> "$GITHUB_OUTPUT"
-        echo "[molley] Report committed: ${REPORT_PATH} on ${target_branch}"
+        echo "[molley] Committed: ${REPORT_PATHS} on ${target_branch}"
 
-    - name: Send report to Slack / Teams / Google Chat
+    - name: Send report(s) to Slack / Teams / Google Chat
       if: steps.commit.outcome == 'success'
       continue-on-error: true
       shell: bash
       env:
-        REPORT_STYLE: ${{ inputs.report_style }}
+        ROUTES: ${{ inputs.routes }}
         DAYS: ${{ inputs.days }}
-        REPORT_FILE: ${{ steps.report.outputs.report_file }}
-        REPORT_PATH: ${{ steps.commit.outputs.report_path }}
+        REPORTS_DIR: ${{ inputs.reports_dir }}
+        GENERATED_STYLES: ${{ steps.report.outputs.generated_styles }}
+        REPORT_STAMP: ${{ steps.commit.outputs.report_stamp }}
         REPORT_BRANCH: ${{ steps.commit.outputs.report_branch }}
         SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
         TEAMS_WEBHOOK_URL: ${{ env.TEAMS_WEBHOOK_URL }}
@@ -397,13 +465,10 @@ runs:
       run: |
         set -euo pipefail
 
-        if [ -z "${SLACK_WEBHOOK_URL:-}" ] && [ -z "${TEAMS_WEBHOOK_URL:-}" ] && [ -z "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
-          echo "[molley] No SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, or GOOGLE_CHAT_WEBHOOK_URL configured — skipping outward delivery"
+        if [ -z "${ROUTES:-}" ] && [ -z "${SLACK_WEBHOOK_URL:-}" ] && [ -z "${TEAMS_WEBHOOK_URL:-}" ] && [ -z "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+          echo "[molley] No routes and no webhook URLs configured — skipping outward delivery"
           exit 0
         fi
-
-        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
-        export TITLE="Product Progress Report (${STYLE}) — last ${DAYS} days"
 
         # Build a full-report, single-message payload per platform. Each platform
         # has its own text dialect and size limits, so the whole conversion lives
@@ -510,32 +575,72 @@ runs:
         NODE_EOF
 
         deliver() {
-          local service_name="$1"
-          local service_key="$2"
-          local webhook_url="$3"
-          echo "[molley] Sending full report to ${service_name}"
+          local service_key="$1"
+          local webhook_url="$2"
+          local label="$3"
+          echo "[molley] Sending full report to ${label}"
           local payload_file
           payload_file="$(mktemp)"
           SERVICE="$service_key" PAYLOAD_FILE="$payload_file" node "$BUILDER"
           if curl --fail --silent --show-error -X POST "$webhook_url" \
             -H 'content-type: application/json; charset=UTF-8' --data-binary @"$payload_file" > /dev/null; then
-            echo "[molley] ${service_name} delivery OK"
+            echo "[molley] ${label} delivery OK"
           else
-            echo "[molley] ${service_name} delivery failed"
+            echo "[molley] ${label} delivery failed"
           fi
           rm -f "$payload_file"
         }
 
-        export REPORT_FILE REPORT_PATH REPORT_BRANCH
+        export REPORT_BRANCH
 
-        if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-          deliver "Slack" "slack" "$SLACK_WEBHOOK_URL"
-        fi
-        if [ -n "${TEAMS_WEBHOOK_URL:-}" ]; then
-          deliver "Teams" "teams" "$TEAMS_WEBHOOK_URL"
-        fi
-        if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
-          deliver "Google Chat" "gchat" "$GOOGLE_CHAT_WEBHOOK_URL"
-        fi
+        for STYLE in $GENERATED_STYLES; do
+          export REPORT_FILE="/tmp/molley-progress-report-${STYLE}.md"
+          export REPORT_PATH="${REPORTS_DIR}/${REPORT_STAMP}-${STYLE}.md"
+          export TITLE="Product Progress Report (${STYLE}) — last ${DAYS} days"
+
+          if [ -n "${ROUTES:-}" ]; then
+            # Destinations for this style, one 'platform|ENV_VAR' per line
+            DESTS="$(STYLE="$STYLE" node -e "
+              const style = process.env.STYLE;
+              for (const line of (process.env.ROUTES || '').split('\n')) {
+                const t = line.trim();
+                if (!t) continue;
+                const i = t.indexOf(':');
+                if (t.slice(0, i).trim().toLowerCase() !== style) continue;
+                for (const d of t.slice(i + 1).split(',')) {
+                  const dt = d.trim();
+                  if (!dt) continue;
+                  const j = dt.indexOf(':');
+                  console.log(dt.slice(0, j).trim().toLowerCase() + '|' + dt.slice(j + 1).trim());
+                }
+              }
+            ")"
+            if [ -z "$DESTS" ]; then
+              echo "[molley] No destinations routed for style ${STYLE}"
+              continue
+            fi
+            while IFS='|' read -r platform env_name; do
+              if [ -z "$platform" ]; then
+                continue
+              fi
+              url="${!env_name:-}"
+              if [ -z "$url" ]; then
+                echo "[molley] Env var ${env_name} is not set or empty — skipping ${platform} delivery for ${STYLE}"
+                continue
+              fi
+              deliver "$platform" "$url" "${platform}:${env_name} (${STYLE})"
+            done <<< "$DESTS"
+          else
+            if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+              deliver "slack" "$SLACK_WEBHOOK_URL" "Slack (${STYLE})"
+            fi
+            if [ -n "${TEAMS_WEBHOOK_URL:-}" ]; then
+              deliver "teams" "$TEAMS_WEBHOOK_URL" "Teams (${STYLE})"
+            fi
+            if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+              deliver "gchat" "$GOOGLE_CHAT_WEBHOOK_URL" "Google Chat (${STYLE})"
+            fi
+          fi
+        done
 
         rm -f "$BUILDER"

@@ -77,15 +77,44 @@ jobs:
           GOOGLE_CHAT_WEBHOOK_URL: ${{ secrets.GOOGLE_CHAT_WEBHOOK_URL }}
 ```
 
-To send different styles to different audiences, add one scheduled workflow
-(or job) per style — e.g. `developer` to the engineering Slack channel every
-Monday, `slt` to a leadership Teams channel every Friday.
+### Multiple reports in one run (`routes`)
+
+To generate several styles in a single cron run and send each to its own
+channels, use the `routes` input instead of `report_style`. One line per
+report: `<style>: <platform>:<ENV_VAR>, ...` where platform is `slack`,
+`teams`, or `gchat`, and `ENV_VAR` names an env var (usually a secret) holding
+that webhook URL. A style may list any number of destinations.
+
+```yaml
+      - uses: molley-io/actions/report@v1
+        with:
+          routes: |
+            slt: slack:SLACK_URL_A, slack:SLACK_URL_B, slack:SLACK_URL_C
+            sales: gchat:GCHAT_URL_Y
+            developer: slack:SLACK_URL_DEV
+          molley_project_id: ${{ vars.MOLLEY_PROJECT_ID }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MOLLEY_API_KEY: ${{ secrets.MOLLEY_API_KEY }}
+          SLACK_URL_A: ${{ secrets.SLACK_WEBHOOK_LEADERSHIP_A }}
+          SLACK_URL_B: ${{ secrets.SLACK_WEBHOOK_LEADERSHIP_B }}
+          SLACK_URL_C: ${{ secrets.SLACK_WEBHOOK_LEADERSHIP_C }}
+          GCHAT_URL_Y: ${{ secrets.GCHAT_WEBHOOK_SALES }}
+          SLACK_URL_DEV: ${{ secrets.SLACK_WEBHOOK_DEV }}
+```
+
+All reports in a run are generated from the same git/Molley evidence window and
+committed together in one commit (each as its own timestamped file). When
+`routes` is set, `report_style` and the legacy `SLACK_WEBHOOK_URL` /
+`TEAMS_WEBHOOK_URL` / `GOOGLE_CHAT_WEBHOOK_URL` env vars are ignored.
+If one style's generation fails, the others still commit and deliver.
 
 ### Inputs
 
 | Input | Default | Description |
 |---|---|---|
-| `report_style` | `developer` | `slt`, `sales`, or `developer` |
+| `report_style` | `developer` | `slt`, `sales`, or `developer` (ignored when `routes` is set) |
+| `routes` | — | Multi-report routing, one `style: platform:ENV_VAR, ...` line per report |
 | `days` | `7` | Look-back window in days (max 14, limited by the Molley activity API) |
 | `molley_project_id` | — | Molley project passport (same value the analyzer action uses) |
 | `reports_dir` | `reports` | Directory the report is committed into |
@@ -107,5 +136,9 @@ Monday, `slt` to a leadership Teams channel every Friday.
 
 | Output | Description |
 |---|---|
-| `report_path` | Repo-relative path of the committed report |
-| `report_branch` | Branch the report was pushed to |
+| `report_paths` | Space-separated repo-relative paths of the committed report(s) |
+| `report_branch` | Branch the report(s) were pushed to |
+
+The three legacy env vars (`SLACK_WEBHOOK_URL`, `TEAMS_WEBHOOK_URL`,
+`GOOGLE_CHAT_WEBHOOK_URL`) still work in single-style mode: every configured
+one receives the report.
