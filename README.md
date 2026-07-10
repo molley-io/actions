@@ -21,8 +21,11 @@ stalling, or winning. Information, not blame.
 The finished report is committed to the `develop` branch if it exists,
 otherwise `main` (overridable), under `/reports/<UTC timestamp>-<style>.md`,
 e.g. `reports/2026-07-10-0600Z-developer.md`. If a Slack, Teams, and/or Google
-Chat incoming webhook is configured, the report summary is also posted to the
-channel with a link to the full report.
+Chat incoming webhook is configured, the **entire report** is also posted to
+the channel as a single message, converted to each platform's formatting
+(Slack mrkdwn blocks, Teams Adaptive Card, Google Chat card). No links out to
+GitHub. Only if a report exceeds the platform's message size limit is it
+truncated, with a note pointing to the committed file path.
 
 ### Report styles
 
@@ -96,9 +99,9 @@ Monday, `slt` to a leadership Teams channel every Friday.
 | `ANTHROPIC_API_KEY` | yes | API key used by the Claude Code CLI |
 | `MOLLEY_API_KEY` | no | Enables the Molley MCP server; without it the report is git-only and says so |
 | `MOLLEY_COMPANY_ID` | no | Only needed if it can't be resolved from the project passport |
-| `SLACK_WEBHOOK_URL` | no | Slack incoming-webhook URL — posts the report summary + link to the channel |
-| `TEAMS_WEBHOOK_URL` | no | Microsoft Teams incoming-webhook URL — posts an Adaptive Card summary + link |
-| `GOOGLE_CHAT_WEBHOOK_URL` | no | Google Chat space incoming-webhook URL — posts a card with the summary + link |
+| `SLACK_WEBHOOK_URL` | no | Slack incoming-webhook URL — posts the full report as mrkdwn blocks |
+| `TEAMS_WEBHOOK_URL` | no | Microsoft Teams incoming-webhook URL — posts the full report as an Adaptive Card |
+| `GOOGLE_CHAT_WEBHOOK_URL` | no | Google Chat space incoming-webhook URL — posts the full report as a card |
 
 ### Outputs
 

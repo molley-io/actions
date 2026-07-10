@@ -403,111 +403,139 @@ runs:
         fi
 
         STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
-        REPORT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${REPORT_BRANCH}/${REPORT_PATH}"
-        TITLE="Product Progress Report (${STYLE}) — last ${DAYS} days"
+        export TITLE="Product Progress Report (${STYLE}) — last ${DAYS} days"
 
-        # Extract the '## Summary' section body for the channel message
-        SUMMARY_FILE="$(mktemp)"
-        REPORT_FILE="$REPORT_FILE" SUMMARY_FILE="$SUMMARY_FILE" node -e "
-          const fs = require('fs');
-          const text = fs.readFileSync(process.env.REPORT_FILE, 'utf8');
-          const m = text.match(/^## Summary\s*\n([\s\S]*?)(?=\n## |\$)/m);
-          const summary = (m ? m[1] : text).trim().slice(0, 2500);
-          fs.writeFileSync(process.env.SUMMARY_FILE, summary);
-        "
+        # Build a full-report, single-message payload per platform. Each platform
+        # has its own text dialect and size limits, so the whole conversion lives
+        # in one node script (quoted heredoc: no shell expansion inside).
+        BUILDER="$(mktemp --suffix=.js)"
+        cat > "$BUILDER" <<'NODE_EOF'
+        const fs = require('fs');
+        const service = process.env.SERVICE;
+        const title = process.env.TITLE;
+        const report = fs.readFileSync(process.env.REPORT_FILE, 'utf8').trim();
+        const truncNote = `… report truncated for chat — the full version is committed in the repository at ${process.env.REPORT_PATH} on ${process.env.REPORT_BRANCH}`;
+
+        // Split on H2 boundaries, then hard-split any oversized section on a line break.
+        function chunk(text, maxLen) {
+          const out = [];
+          for (const section of text.split(/\n(?=## )/)) {
+            let rest = section.trim();
+            while (rest.length > maxLen) {
+              let cut = rest.lastIndexOf('\n', maxLen);
+              if (cut < maxLen * 0.5) cut = maxLen;
+              out.push(rest.slice(0, cut).trim());
+              rest = rest.slice(cut).trim();
+            }
+            if (rest) out.push(rest);
+          }
+          return out;
+        }
+
+        // Keep chunks until the total budget is spent; flag if anything was dropped.
+        function fitBudget(chunks, budget) {
+          const kept = [];
+          let used = 0;
+          for (const c of chunks) {
+            if (used + c.length > budget) return { kept, truncated: true };
+            kept.push(c);
+            used += c.length;
+          }
+          return { kept, truncated: false };
+        }
+
+        let payload;
+
+        if (service === 'slack') {
+          // mrkdwn: headers become bold, ** becomes *. 3000-char block limit, 50-block message limit.
+          const toMrkdwn = (t) => t
+            .replace(/^#{1,6}\s+(.*)$/gm, '*$1*')
+            .replace(/\*\*(.+?)\*\*/g, '*$1*');
+          const { kept, truncated } = fitBudget(chunk(toMrkdwn(report), 2900), 36000);
+          const blocks = [
+            { type: 'header', text: { type: 'plain_text', text: title, emoji: true } },
+            ...kept.slice(0, 47).map((c) => ({ type: 'section', text: { type: 'mrkdwn', text: c } })),
+          ];
+          if (truncated || kept.length > 47) {
+            blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: truncNote }] });
+          }
+          payload = { text: title, blocks };
+        }
+
+        if (service === 'teams') {
+          // Adaptive Card TextBlocks render basic markdown but not # headers.
+          const toCardMd = (t) => t.replace(/^#{1,6}\s+(.*)$/gm, '**$1**');
+          const { kept, truncated } = fitBudget(chunk(toCardMd(report), 6000), 24000);
+          const body = [
+            { type: 'TextBlock', size: 'Large', weight: 'Bolder', wrap: true, text: title },
+            ...kept.map((c) => ({ type: 'TextBlock', wrap: true, separator: true, text: c })),
+          ];
+          if (truncated) body.push({ type: 'TextBlock', wrap: true, isSubtle: true, text: truncNote });
+          payload = {
+            type: 'message',
+            attachments: [{
+              contentType: 'application/vnd.microsoft.card.adaptive',
+              content: {
+                $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+                type: 'AdaptiveCard',
+                version: '1.4',
+                body,
+              },
+            }],
+          };
+        }
+
+        if (service === 'gchat') {
+          // textParagraph takes limited HTML: escape, then headers/bold to <b>, newlines to <br>.
+          const toHtml = (t) => t
+            .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/^#{1,6}\s+(.*)$/gm, '<b>$1</b>')
+            .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+            .replace(/\n/g, '<br>');
+          const { kept, truncated } = fitBudget(chunk(report, 6000), 24000);
+          const widgets = kept.map((c) => ({ textParagraph: { text: toHtml(c) } }));
+          if (truncated) widgets.push({ textParagraph: { text: '<i>' + toHtml(truncNote) + '</i>' } });
+          payload = {
+            cardsV2: [{
+              cardId: 'molley-progress-report',
+              card: {
+                header: { title },
+                sections: [{ widgets }],
+              },
+            }],
+          };
+        }
+
+        fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+        NODE_EOF
+
+        deliver() {
+          local service_name="$1"
+          local service_key="$2"
+          local webhook_url="$3"
+          echo "[molley] Sending full report to ${service_name}"
+          local payload_file
+          payload_file="$(mktemp)"
+          SERVICE="$service_key" PAYLOAD_FILE="$payload_file" node "$BUILDER"
+          if curl --fail --silent --show-error -X POST "$webhook_url" \
+            -H 'content-type: application/json; charset=UTF-8' --data-binary @"$payload_file" > /dev/null; then
+            echo "[molley] ${service_name} delivery OK"
+          else
+            echo "[molley] ${service_name} delivery failed"
+          fi
+          rm -f "$payload_file"
+        }
+
+        export REPORT_FILE REPORT_PATH REPORT_BRANCH
 
         if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
-          echo "[molley] Sending report summary to Slack"
-          PAYLOAD_FILE="$(mktemp)"
-          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
-            const fs = require('fs');
-            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
-            const payload = {
-              text: process.env.TITLE + '\n' + summary + '\n<' + process.env.REPORT_URL + '|Read the full report>',
-              blocks: [
-                { type: 'header', text: { type: 'plain_text', text: process.env.TITLE, emoji: true } },
-                { type: 'section', text: { type: 'mrkdwn', text: summary } },
-                { type: 'section', text: { type: 'mrkdwn', text: '<' + process.env.REPORT_URL + '|Read the full report>' } },
-              ],
-            };
-            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
-          "
-          if curl --fail --silent --show-error -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'content-type: application/json' --data-binary @"$PAYLOAD_FILE"; then
-            echo "[molley] Slack delivery OK"
-          else
-            echo "[molley] Slack delivery failed"
-          fi
-          rm -f "$PAYLOAD_FILE"
+          deliver "Slack" "slack" "$SLACK_WEBHOOK_URL"
         fi
-
         if [ -n "${TEAMS_WEBHOOK_URL:-}" ]; then
-          echo "[molley] Sending report summary to Teams"
-          PAYLOAD_FILE="$(mktemp)"
-          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
-            const fs = require('fs');
-            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
-            const payload = {
-              type: 'message',
-              attachments: [{
-                contentType: 'application/vnd.microsoft.card.adaptive',
-                content: {
-                  \$schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
-                  type: 'AdaptiveCard',
-                  version: '1.4',
-                  body: [
-                    { type: 'TextBlock', size: 'Large', weight: 'Bolder', wrap: true, text: process.env.TITLE },
-                    { type: 'TextBlock', wrap: true, text: summary },
-                  ],
-                  actions: [
-                    { type: 'Action.OpenUrl', title: 'Read the full report', url: process.env.REPORT_URL },
-                  ],
-                },
-              }],
-            };
-            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
-          "
-          if curl --fail --silent --show-error -X POST "$TEAMS_WEBHOOK_URL" \
-            -H 'content-type: application/json' --data-binary @"$PAYLOAD_FILE"; then
-            echo "[molley] Teams delivery OK"
-          else
-            echo "[molley] Teams delivery failed"
-          fi
-          rm -f "$PAYLOAD_FILE"
+          deliver "Teams" "teams" "$TEAMS_WEBHOOK_URL"
         fi
-
         if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
-          echo "[molley] Sending report summary to Google Chat"
-          PAYLOAD_FILE="$(mktemp)"
-          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
-            const fs = require('fs');
-            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
-            const payload = {
-              text: process.env.TITLE + '\n' + summary + '\n<' + process.env.REPORT_URL + '|Read the full report>',
-              cardsV2: [{
-                cardId: 'molley-progress-report',
-                card: {
-                  header: { title: process.env.TITLE },
-                  sections: [{
-                    widgets: [
-                      { textParagraph: { text: summary } },
-                      { buttonList: { buttons: [
-                        { text: 'Read the full report', onClick: { openLink: { url: process.env.REPORT_URL } } },
-                      ] } },
-                    ],
-                  }],
-                },
-              }],
-            };
-            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
-          "
-          if curl --fail --silent --show-error -X POST "$GOOGLE_CHAT_WEBHOOK_URL" \
-            -H 'content-type: application/json; charset=UTF-8' --data-binary @"$PAYLOAD_FILE"; then
-            echo "[molley] Google Chat delivery OK"
-          else
-            echo "[molley] Google Chat delivery failed"
-          fi
-          rm -f "$PAYLOAD_FILE"
+          deliver "Google Chat" "gchat" "$GOOGLE_CHAT_WEBHOOK_URL"
         fi
 
-        rm -f "$SUMMARY_FILE"
+        rm -f "$BUILDER"
