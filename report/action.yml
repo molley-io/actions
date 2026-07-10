@@ -258,9 +258,10 @@ runs:
           printf '%s\n' "You are writing a periodic product progress report covering the last ${DAYS} days for the repository you are running in (a monorepo — treat top-level directories/workspaces as product areas)."
           printf '%s\n' ""
           printf '%s\n' "NON-NEGOTIABLE RULES:"
-          printf '%s\n' "- Never name, identify, or allude to any individual person: no author names, usernames, emails, or per-person statistics — even if they appear in commit messages or Molley data. If a commit message contains a name, paraphrase the work without it."
+          printf '%s\n' "- Never name, identify, or allude to any individual person: no author names, usernames, emails, or per-person statistics — even if they appear in commit messages or product tooling data. If a commit message contains a name, paraphrase the work without it."
           printf '%s\n' "- No blame, no shaming, no performance judgements about contributors. This report is about where the PRODUCT is moving, stuck, stalling, or winning — it is information, not accusation. Describe stalls as facts about the work ('the billing area saw no movement this week'), never as failures of people."
           printf '%s\n' "- Be honest: if something is stalled or blocked, say so plainly and factually."
+          printf '%s\n' "- Never mention 'Molley' anywhere in the report — not as a tool name, data source, or brand. When you draw on its data, attribute it generically instead: 'the CRM', 'the requirements tool', 'product research', 'the product wiki', 'outreach tracking', and so on."
           printf '%s\n' "- Return MARKDOWN ONLY — no prose before or after the document, no code fences wrapping it."
           printf '%s\n' ""
           printf '%s\n' "HOW TO GATHER EVIDENCE:"
@@ -272,9 +273,9 @@ runs:
             else
               printf '%s\n' "2. Use the Molley MCP server: call list_products to find the product for this repository, then get_product_activity (days ${DAYS}) and get_product_overview for product-side activity and direction."
             fi
-            printf '%s\n' "3. Weave BOTH sources together: git tells you what was built; Molley tells you what was planned, shipped, researched, and sold."
+            printf '%s\n' "3. Weave BOTH sources together: git tells you what was built; the product tooling tells you what was planned, shipped, researched, and sold. Remember: in the report itself, refer to that tooling only in generic terms (CRM, requirements tool, product research, product wiki) — never by the name Molley."
           else
-            printf '%s\n' "2. Molley product data is NOT available in this run — build the report from git history and the codebase alone, and note in the report that product-side (Molley) activity was not included."
+            printf '%s\n' "2. Product-side data is NOT available in this run — build the report from git history and the codebase alone, and note in the report that activity from the requirements/CRM tooling was not included (do not name the tool)."
           fi
 
           printf '%s\n' ""
@@ -296,7 +297,7 @@ runs:
             sales)
               printf '%s\n' "AUDIENCE: the sales and marketing team."
               printf '%s\n' "- Focus on customer-visible progress: what shipped that a customer can see or buy, what is coming next and roughly when, and what changed in positioning-relevant capability."
-              printf '%s\n' "- If Molley data is available, include outreach, social campaign, and CRM pipeline activity in a dedicated '## Go-to-Market Activity' section."
+              printf '%s\n' "- If CRM/outreach data is available, include outreach, social campaign, and CRM pipeline activity in a dedicated '## Go-to-Market Activity' section."
               printf '%s\n' "- Add a '## Talking Points' section: 3-5 bullets sales can use with prospects this week."
               printf '%s\n' "- Skip internal engineering detail unless it affects what can be promised to customers."
               ;;
@@ -358,14 +359,19 @@ runs:
           "$CLAUDE_BIN" "${RUN_ARGS[@]}" "$(cat "$PROMPT_FILE")" > "$OUTPUT_FILE" || STYLE_FAILED=1
           rm -f "$PROMPT_FILE"
 
-          # Strip a wrapping markdown fence if the model added one despite instructions
+          # Strip a wrapping markdown fence if the model added one despite instructions,
+          # and scrub any 'Molley' brand mention that slipped past the prompt (the
+          # .molley/ directory path is left intact — only the standalone name is replaced).
           if [ -s "$OUTPUT_FILE" ]; then
             OUTPUT_FILE="$OUTPUT_FILE" node -e "
               const fs = require('fs');
               const p = process.env.OUTPUT_FILE;
               let t = fs.readFileSync(p, 'utf8').trim();
               const m = t.match(/^\`\`\`(?:markdown|md)?\n([\s\S]*)\n\`\`\`\$/);
-              if (m) fs.writeFileSync(p, m[1] + '\n');
+              if (m) t = m[1].trim();
+              const scrubbed = t.replace(/\bMolley\b/g, 'the product tooling');
+              if (scrubbed !== t) console.error('[molley] Scrubbed brand mention(s) from report output');
+              fs.writeFileSync(p, scrubbed + '\n');
             "
           fi
 
