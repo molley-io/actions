@@ -1,0 +1,513 @@
+name: Molley Progress Report
+description: AI-generated progress report from git history and Molley activity, committed to /reports on develop or main
+
+author: Molley
+
+inputs:
+  report_style:
+    description: 'Report audience/style: slt | sales | developer'
+    required: false
+    default: developer
+  days:
+    description: Look-back window in days (max 14 — limited by the Molley activity API)
+    required: false
+    default: '7'
+  molley_project_id:
+    description: Molley project passport (same value used by the analyzer action)
+    required: false
+  reports_dir:
+    description: Directory in the repository where reports are committed
+    required: false
+    default: reports
+  output_branch:
+    description: Branch to commit the report to. Empty = auto (develop if it exists, otherwise main)
+    required: false
+    default: ''
+  model:
+    description: Claude model used to write the report
+    required: false
+    default: claude-opus-4-6
+
+outputs:
+  report_path:
+    description: Repository-relative path of the committed report
+    value: ${{ steps.commit.outputs.report_path }}
+  report_branch:
+    description: Branch the report was committed to
+    value: ${{ steps.commit.outputs.report_branch }}
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout repository (full history)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Validate required environment
+      shell: bash
+      env:
+        REPORT_STYLE: ${{ inputs.report_style }}
+      run: |
+        set -euo pipefail
+        echo "[molley] Validating required environment"
+        if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+          echo "ANTHROPIC_API_KEY is required"
+          exit 1
+        fi
+        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+        case "$STYLE" in
+          slt|sales|developer) ;;
+          *)
+            echo "Invalid report_style '${REPORT_STYLE}' — must be one of: slt, sales, developer"
+            exit 1
+            ;;
+        esac
+        echo "[molley] ANTHROPIC_API_KEY is present, report style: ${STYLE}"
+
+    - name: Install Claude Code CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "[molley] Installing Claude Code CLI"
+        npm install -g @anthropic-ai/claude-code
+        echo "$(npm config get prefix)/bin" >> "$GITHUB_PATH"
+        echo "[molley] Node version: $(node --version)"
+
+    - name: Setup Molley MCP Server for product activity
+      id: mcp-setup
+      continue-on-error: true
+      shell: bash
+      env:
+        MOLLEY_API_KEY: ${{ env.MOLLEY_API_KEY }}
+        MOLLEY_COMPANY_ID: ${{ env.MOLLEY_COMPANY_ID }}
+        MOLLEY_PROJECT_PASSPORT: ${{ inputs.molley_project_id }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${MOLLEY_API_KEY:-}" ]; then
+          echo "[molley] MOLLEY_API_KEY not set — skipping MCP server setup (report will use git history only)"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        RESOLVED_COMPANY_ID="${MOLLEY_COMPANY_ID:-}"
+        RESOLVED_PROJECT_ID=""
+
+        if [ -n "${MOLLEY_PROJECT_PASSPORT:-}" ]; then
+          DECODED=$(node -e "
+            const passport = process.env.MOLLEY_PROJECT_PASSPORT || '';
+            const encoded = passport.split('.')[0] || '';
+            try {
+              const json = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
+              process.stdout.write(JSON.stringify(json));
+            } catch { process.stdout.write('{}'); }
+          " 2>/dev/null || echo '{}')
+
+          PASSPORT_COMPANY=$(echo "$DECODED" | node -e "const d=require('fs').readFileSync(0,'utf8');try{process.stdout.write(JSON.parse(d).companyId||'')}catch{}" 2>/dev/null || true)
+          PASSPORT_PROJECT=$(echo "$DECODED" | node -e "const d=require('fs').readFileSync(0,'utf8');try{process.stdout.write(JSON.parse(d).projectId||'')}catch{}" 2>/dev/null || true)
+
+          if [ -z "$RESOLVED_COMPANY_ID" ] && [ -n "$PASSPORT_COMPANY" ]; then
+            RESOLVED_COMPANY_ID="$PASSPORT_COMPANY"
+          fi
+          if [ -n "$PASSPORT_PROJECT" ]; then
+            RESOLVED_PROJECT_ID="$PASSPORT_PROJECT"
+          fi
+        fi
+
+        if [ -z "$RESOLVED_COMPANY_ID" ]; then
+          echo "[molley] Cannot resolve company ID — skipping MCP server setup"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "[molley] Installing Molley MCP server"
+        npm install -g @molley/mcp-server
+
+        echo "[molley] Configuring MCP server credentials"
+        npx @molley/mcp-server login --api-key "$MOLLEY_API_KEY" --company-id "$RESOLVED_COMPANY_ID"
+
+        if command -v claude-code >/dev/null 2>&1; then
+          CLAUDE_BIN="claude-code"
+        elif command -v claude >/dev/null 2>&1; then
+          CLAUDE_BIN="claude"
+        else
+          echo "[molley] Claude CLI not found — skipping MCP registration"
+          echo "mcp_available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        echo "[molley] Registering MCP server with Claude Code"
+        "$CLAUDE_BIN" mcp add molley -- npx @molley/mcp-server
+
+        echo "mcp_available=true" >> "$GITHUB_OUTPUT"
+        echo "project_id=${RESOLVED_PROJECT_ID}" >> "$GITHUB_OUTPUT"
+        echo "[molley] MCP server configured — Molley activity will be included in the report"
+
+    - name: Build git activity digest
+      id: git-digest
+      shell: bash
+      env:
+        DAYS: ${{ inputs.days }}
+      run: |
+        set -euo pipefail
+        echo "[molley] Building git digest for the last ${DAYS} days"
+        DIGEST_FILE="/tmp/molley-git-digest.txt"
+        SINCE="${DAYS} days ago"
+
+        # No author fields anywhere: the report must describe the product, not people.
+        {
+          printf '%s\n' "== Commits (last ${DAYS} days, newest first, no merges) =="
+          git log --no-merges --since="$SINCE" --date=short --pretty=format:'%ad %h %s' || true
+          printf '\n\n%s\n' "== Merges / integrated branches (last ${DAYS} days) =="
+          git log --merges --since="$SINCE" --date=short --pretty=format:'%ad %s' || true
+          printf '\n\n%s\n' "== Activity by top-level area (files touched, lines added/removed) =="
+          git log --no-merges --since="$SINCE" --numstat --pretty=format:'' \
+            | awk 'NF==3 {
+                n=split($3, p, "/");
+                area = (n > 1) ? p[1] : "(repo root)";
+                files[area]++;
+                add[area] += $1 + 0;
+                del[area] += $2 + 0;
+              }
+              END { for (a in files) printf "%s: %d changes, +%d/-%d lines\n", a, files[a], add[a], del[a] }' \
+            | sort || true
+          printf '\n%s\n' "== Totals =="
+          printf 'Commits: %s\n' "$(git rev-list --no-merges --count --since="$SINCE" HEAD)"
+          printf 'Merges: %s\n' "$(git rev-list --merges --count --since="$SINCE" HEAD)"
+        } > "$DIGEST_FILE"
+
+        echo "[molley] Digest size: $(wc -c < "$DIGEST_FILE") bytes"
+        echo "digest_file=${DIGEST_FILE}" >> "$GITHUB_OUTPUT"
+
+    - name: Generate report with Claude Code
+      id: report
+      shell: bash
+      env:
+        REPORT_STYLE: ${{ inputs.report_style }}
+        DAYS: ${{ inputs.days }}
+        CLAUDE_MODEL: ${{ inputs.model }}
+        MCP_AVAILABLE: ${{ steps.mcp-setup.outputs.mcp_available }}
+        MCP_PROJECT_ID: ${{ steps.mcp-setup.outputs.project_id }}
+        DIGEST_FILE: ${{ steps.git-digest.outputs.digest_file }}
+      run: |
+        set -euo pipefail
+        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+        echo "[molley] Generating ${STYLE} report covering the last ${DAYS} days"
+
+        PROMPT_FILE="$(mktemp)"
+        OUTPUT_FILE="/tmp/molley-progress-report.md"
+        REPORT_FAILED=0
+
+        {
+          printf '%s\n' "You are writing a periodic product progress report covering the last ${DAYS} days for the repository you are running in (a monorepo — treat top-level directories/workspaces as product areas)."
+          printf '%s\n' ""
+          printf '%s\n' "NON-NEGOTIABLE RULES:"
+          printf '%s\n' "- Never name, identify, or allude to any individual person: no author names, usernames, emails, or per-person statistics — even if they appear in commit messages or Molley data. If a commit message contains a name, paraphrase the work without it."
+          printf '%s\n' "- No blame, no shaming, no performance judgements about contributors. This report is about where the PRODUCT is moving, stuck, stalling, or winning — it is information, not accusation. Describe stalls as facts about the work ('the billing area saw no movement this week'), never as failures of people."
+          printf '%s\n' "- Be honest: if something is stalled or blocked, say so plainly and factually."
+          printf '%s\n' "- Return MARKDOWN ONLY — no prose before or after the document, no code fences wrapping it."
+          printf '%s\n' ""
+          printf '%s\n' "HOW TO GATHER EVIDENCE:"
+          printf '%s\n' "1. Start from the git digest below, then dig deeper yourself with git (e.g. 'git log --since=\"${DAYS} days ago\"', 'git show', 'git diff') and by reading the codebase to understand what the changes actually mean at product level. Interpret — do not just restate commit messages."
+
+          if [ "${MCP_AVAILABLE:-false}" = "true" ]; then
+            if [ -n "${MCP_PROJECT_ID:-}" ]; then
+              printf '%s\n' "2. Use the Molley MCP server: call get_product_activity with projectId '${MCP_PROJECT_ID}' and days ${DAYS} for everything that happened on the product side (features, wiki, research, outreach, social, CRM). Also call get_product_overview with projectId '${MCP_PROJECT_ID}' to understand feature statuses and where the product is heading."
+            else
+              printf '%s\n' "2. Use the Molley MCP server: call list_products to find the product for this repository, then get_product_activity (days ${DAYS}) and get_product_overview for product-side activity and direction."
+            fi
+            printf '%s\n' "3. Weave BOTH sources together: git tells you what was built; Molley tells you what was planned, shipped, researched, and sold."
+          else
+            printf '%s\n' "2. Molley product data is NOT available in this run — build the report from git history and the codebase alone, and note in the report that product-side (Molley) activity was not included."
+          fi
+
+          printf '%s\n' ""
+          printf '%s\n' "REPORT STRUCTURE (H1 title first: '# Product Progress Report — ${STYLE^^} — last ${DAYS} days', then a metadata line with the date range and the audience):"
+          printf '%s\n' "- ## Summary — 3-6 sentences: overall momentum and the single most important takeaway."
+          printf '%s\n' "- ## Successes — what moved forward, shipped, or was unblocked."
+          printf '%s\n' "- ## Blockers & Stalls — what is stuck or slowing, why (as far as evidence shows), and what it is waiting on."
+          printf '%s\n' "- ## Where We're Heading — direction implied by in-progress work and the roadmap/feature statuses."
+          printf '%s\n' "- ## Watch Items — early signals worth monitoring next period."
+          printf '%s\n' ""
+
+          case "$STYLE" in
+            slt)
+              printf '%s\n' "AUDIENCE: the senior leadership team."
+              printf '%s\n' "- Write in plain business language; no code paths, file names, or technical jargon."
+              printf '%s\n' "- Lead with momentum, risk, and strategic direction. Frame everything in terms of product outcomes, customer value, and delivery confidence."
+              printf '%s\n' "- Keep it tight: the whole report should be readable in under three minutes."
+              ;;
+            sales)
+              printf '%s\n' "AUDIENCE: the sales and marketing team."
+              printf '%s\n' "- Focus on customer-visible progress: what shipped that a customer can see or buy, what is coming next and roughly when, and what changed in positioning-relevant capability."
+              printf '%s\n' "- If Molley data is available, include outreach, social campaign, and CRM pipeline activity in a dedicated '## Go-to-Market Activity' section."
+              printf '%s\n' "- Add a '## Talking Points' section: 3-5 bullets sales can use with prospects this week."
+              printf '%s\n' "- Skip internal engineering detail unless it affects what can be promised to customers."
+              ;;
+            developer)
+              printf '%s\n' "AUDIENCE: the engineering team."
+              printf '%s\n' "- Be technically specific: which areas of the monorepo moved, which were churn hotspots, which are quiet or stalled."
+              printf '%s\n' "- Cover delivery flow (merges/integrations), notable refactors, test/tooling changes, and technical debt signals."
+              printf '%s\n' "- Add a '## Codebase Activity Map' section summarising per-area movement."
+              printf '%s\n' "- Reference directories and subsystems freely, but still never authors."
+              ;;
+          esac
+
+          printf '\n%s\n' "GIT DIGEST (pre-computed, last ${DAYS} days):"
+          printf '%s\n' "-----BEGIN GIT DIGEST-----"
+          head -c 40000 "$DIGEST_FILE"
+          printf '\n%s\n' "-----END GIT DIGEST-----"
+        } > "$PROMPT_FILE"
+
+        PROMPT="$(cat "$PROMPT_FILE")"
+
+        if command -v claude-code >/dev/null 2>&1; then
+          CLAUDE_BIN="claude-code"
+        elif command -v claude >/dev/null 2>&1; then
+          CLAUDE_BIN="claude"
+        else
+          echo "[molley] Claude CLI binary not found after install"
+          exit 1
+        fi
+
+        CLI_HELP="$($CLAUDE_BIN --help 2>&1 || true)"
+        RUN_ARGS=()
+        if printf '%s' "$CLI_HELP" | grep -q -- '--model'; then
+          RUN_ARGS+=(--model "$CLAUDE_MODEL")
+          echo "[molley] Using model: ${CLAUDE_MODEL}"
+        fi
+        if printf '%s' "$CLI_HELP" | grep -q -- '--dangerously-skip-permissions'; then
+          RUN_ARGS+=(--dangerously-skip-permissions)
+        fi
+        if printf '%s' "$CLI_HELP" | grep -q -- '--print'; then
+          RUN_ARGS+=(--print)
+        fi
+
+        heartbeat() {
+          while true; do
+            echo "[molley] Report generation still running..."
+            sleep 20
+          done
+        }
+        heartbeat &
+        HEARTBEAT_PID=$!
+
+        "$CLAUDE_BIN" "${RUN_ARGS[@]}" "$PROMPT" > "$OUTPUT_FILE" || REPORT_FAILED=1
+
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+        rm -f "$PROMPT_FILE"
+
+        # Strip a wrapping markdown fence if the model added one despite instructions
+        if [ -s "$OUTPUT_FILE" ]; then
+          OUTPUT_FILE="$OUTPUT_FILE" node -e "
+            const fs = require('fs');
+            const p = process.env.OUTPUT_FILE;
+            let t = fs.readFileSync(p, 'utf8').trim();
+            const m = t.match(/^\`\`\`(?:markdown|md)?\n([\s\S]*)\n\`\`\`\$/);
+            if (m) fs.writeFileSync(p, m[1] + '\n');
+          "
+        fi
+
+        if [ "$REPORT_FAILED" -ne 0 ] || [ ! -s "$OUTPUT_FILE" ] || [ "$(wc -c < "$OUTPUT_FILE")" -lt 200 ]; then
+          echo "[molley] Report generation failed or produced no usable output"
+          exit 1
+        fi
+
+        echo "[molley] Report size: $(wc -c < "$OUTPUT_FILE") bytes"
+        echo "report_file=${OUTPUT_FILE}" >> "$GITHUB_OUTPUT"
+
+    - name: Commit report
+      id: commit
+      shell: bash
+      env:
+        REPORT_STYLE: ${{ inputs.report_style }}
+        REPORTS_DIR: ${{ inputs.reports_dir }}
+        OUTPUT_BRANCH: ${{ inputs.output_branch }}
+        REPORT_FILE: ${{ steps.report.outputs.report_file }}
+      run: |
+        set -euo pipefail
+        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+        git config user.name "molley-bot"
+        git config user.email "actions@users.noreply.github.com"
+
+        if [ -n "$OUTPUT_BRANCH" ]; then
+          target_branch="$OUTPUT_BRANCH"
+        elif git ls-remote --exit-code --heads origin develop >/dev/null 2>&1; then
+          target_branch="develop"
+        elif git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+          target_branch="main"
+        else
+          target_branch="${GITHUB_REF_NAME:-main}"
+        fi
+        echo "[molley] Target branch: ${target_branch}"
+
+        STAMP="$(date -u +"%Y-%m-%d-%H%MZ")"
+        REPORT_PATH="${REPORTS_DIR}/${STAMP}-${STYLE}.md"
+
+        pushed="false"
+        for attempt in 1 2 3; do
+          echo "[molley] Commit attempt ${attempt}/3 on branch ${target_branch}"
+          git fetch origin "$target_branch"
+          git checkout -B "molley-report-${GITHUB_RUN_ID:-local}" "origin/$target_branch"
+
+          mkdir -p "$(dirname "$REPORT_PATH")"
+          cp "$REPORT_FILE" "$REPORT_PATH"
+
+          git add "$REPORT_PATH"
+          git commit -m "docs(molley): ${STYLE} progress report ${STAMP}"
+
+          if git push origin "HEAD:${target_branch}"; then
+            echo "[molley] Report pushed to ${target_branch}"
+            pushed="true"
+            break
+          fi
+
+          echo "[molley] Push failed due to branch movement; retrying"
+        done
+
+        if [ "$pushed" != "true" ]; then
+          echo "[molley] Failed to push report after retries"
+          exit 1
+        fi
+
+        echo "report_path=${REPORT_PATH}" >> "$GITHUB_OUTPUT"
+        echo "report_branch=${target_branch}" >> "$GITHUB_OUTPUT"
+        echo "[molley] Report committed: ${REPORT_PATH} on ${target_branch}"
+
+    - name: Send report to Slack / Teams / Google Chat
+      if: steps.commit.outcome == 'success'
+      continue-on-error: true
+      shell: bash
+      env:
+        REPORT_STYLE: ${{ inputs.report_style }}
+        DAYS: ${{ inputs.days }}
+        REPORT_FILE: ${{ steps.report.outputs.report_file }}
+        REPORT_PATH: ${{ steps.commit.outputs.report_path }}
+        REPORT_BRANCH: ${{ steps.commit.outputs.report_branch }}
+        SLACK_WEBHOOK_URL: ${{ env.SLACK_WEBHOOK_URL }}
+        TEAMS_WEBHOOK_URL: ${{ env.TEAMS_WEBHOOK_URL }}
+        GOOGLE_CHAT_WEBHOOK_URL: ${{ env.GOOGLE_CHAT_WEBHOOK_URL }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${SLACK_WEBHOOK_URL:-}" ] && [ -z "${TEAMS_WEBHOOK_URL:-}" ] && [ -z "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+          echo "[molley] No SLACK_WEBHOOK_URL, TEAMS_WEBHOOK_URL, or GOOGLE_CHAT_WEBHOOK_URL configured — skipping outward delivery"
+          exit 0
+        fi
+
+        STYLE="$(echo "$REPORT_STYLE" | tr '[:upper:]' '[:lower:]')"
+        REPORT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${REPORT_BRANCH}/${REPORT_PATH}"
+        TITLE="Product Progress Report (${STYLE}) — last ${DAYS} days"
+
+        # Extract the '## Summary' section body for the channel message
+        SUMMARY_FILE="$(mktemp)"
+        REPORT_FILE="$REPORT_FILE" SUMMARY_FILE="$SUMMARY_FILE" node -e "
+          const fs = require('fs');
+          const text = fs.readFileSync(process.env.REPORT_FILE, 'utf8');
+          const m = text.match(/^## Summary\s*\n([\s\S]*?)(?=\n## |\$)/m);
+          const summary = (m ? m[1] : text).trim().slice(0, 2500);
+          fs.writeFileSync(process.env.SUMMARY_FILE, summary);
+        "
+
+        if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+          echo "[molley] Sending report summary to Slack"
+          PAYLOAD_FILE="$(mktemp)"
+          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
+            const fs = require('fs');
+            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
+            const payload = {
+              text: process.env.TITLE + '\n' + summary + '\n<' + process.env.REPORT_URL + '|Read the full report>',
+              blocks: [
+                { type: 'header', text: { type: 'plain_text', text: process.env.TITLE, emoji: true } },
+                { type: 'section', text: { type: 'mrkdwn', text: summary } },
+                { type: 'section', text: { type: 'mrkdwn', text: '<' + process.env.REPORT_URL + '|Read the full report>' } },
+              ],
+            };
+            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+          "
+          if curl --fail --silent --show-error -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'content-type: application/json' --data-binary @"$PAYLOAD_FILE"; then
+            echo "[molley] Slack delivery OK"
+          else
+            echo "[molley] Slack delivery failed"
+          fi
+          rm -f "$PAYLOAD_FILE"
+        fi
+
+        if [ -n "${TEAMS_WEBHOOK_URL:-}" ]; then
+          echo "[molley] Sending report summary to Teams"
+          PAYLOAD_FILE="$(mktemp)"
+          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
+            const fs = require('fs');
+            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
+            const payload = {
+              type: 'message',
+              attachments: [{
+                contentType: 'application/vnd.microsoft.card.adaptive',
+                content: {
+                  \$schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+                  type: 'AdaptiveCard',
+                  version: '1.4',
+                  body: [
+                    { type: 'TextBlock', size: 'Large', weight: 'Bolder', wrap: true, text: process.env.TITLE },
+                    { type: 'TextBlock', wrap: true, text: summary },
+                  ],
+                  actions: [
+                    { type: 'Action.OpenUrl', title: 'Read the full report', url: process.env.REPORT_URL },
+                  ],
+                },
+              }],
+            };
+            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+          "
+          if curl --fail --silent --show-error -X POST "$TEAMS_WEBHOOK_URL" \
+            -H 'content-type: application/json' --data-binary @"$PAYLOAD_FILE"; then
+            echo "[molley] Teams delivery OK"
+          else
+            echo "[molley] Teams delivery failed"
+          fi
+          rm -f "$PAYLOAD_FILE"
+        fi
+
+        if [ -n "${GOOGLE_CHAT_WEBHOOK_URL:-}" ]; then
+          echo "[molley] Sending report summary to Google Chat"
+          PAYLOAD_FILE="$(mktemp)"
+          TITLE="$TITLE" SUMMARY_FILE="$SUMMARY_FILE" REPORT_URL="$REPORT_URL" PAYLOAD_FILE="$PAYLOAD_FILE" node -e "
+            const fs = require('fs');
+            const summary = fs.readFileSync(process.env.SUMMARY_FILE, 'utf8');
+            const payload = {
+              text: process.env.TITLE + '\n' + summary + '\n<' + process.env.REPORT_URL + '|Read the full report>',
+              cardsV2: [{
+                cardId: 'molley-progress-report',
+                card: {
+                  header: { title: process.env.TITLE },
+                  sections: [{
+                    widgets: [
+                      { textParagraph: { text: summary } },
+                      { buttonList: { buttons: [
+                        { text: 'Read the full report', onClick: { openLink: { url: process.env.REPORT_URL } } },
+                      ] } },
+                    ],
+                  }],
+                },
+              }],
+            };
+            fs.writeFileSync(process.env.PAYLOAD_FILE, JSON.stringify(payload));
+          "
+          if curl --fail --silent --show-error -X POST "$GOOGLE_CHAT_WEBHOOK_URL" \
+            -H 'content-type: application/json; charset=UTF-8' --data-binary @"$PAYLOAD_FILE"; then
+            echo "[molley] Google Chat delivery OK"
+          else
+            echo "[molley] Google Chat delivery failed"
+          fi
+          rm -f "$PAYLOAD_FILE"
+        fi
+
+        rm -f "$SUMMARY_FILE"
