@@ -20,6 +20,14 @@ inputs:
     description: Look-back window in days (max 14 — limited by the Molley activity API)
     required: false
     default: '7'
+  max_words:
+    description: >-
+      Hard cap on report length in words. A single number applies to every report in the run
+      (e.g. '600'), or set per style with 'style: number' entries separated by commas or
+      newlines (e.g. 'slt: 400, developer: 900'). Styles without an entry use their built-in
+      default (slt: 500; sales and developer: uncapped).
+    required: false
+    default: ''
   molley_project_id:
     description: Molley project passport (same value used by the analyzer action)
     required: false
@@ -62,12 +70,29 @@ runs:
       env:
         REPORT_STYLE: ${{ inputs.report_style }}
         ROUTES: ${{ inputs.routes }}
+        MAX_WORDS: ${{ inputs.max_words }}
       run: |
         set -euo pipefail
         echo "[molley] Validating required environment"
         if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
           echo "ANTHROPIC_API_KEY is required"
           exit 1
+        fi
+
+        if [ -n "${MAX_WORDS:-}" ]; then
+          node -e "
+            const raw = (process.env.MAX_WORDS || '').trim();
+            if (/^\d+\$/.test(raw)) process.exit(0);
+            for (const part of raw.split(/[\n,]+/)) {
+              const t = part.trim();
+              if (!t) continue;
+              if (!/^(slt|sales|developer)\s*[:=]\s*\d+\$/i.test(t)) {
+                console.error('Invalid max_words entry: \"' + t + '\" — use a single number or \"style: number\" (styles: slt, sales, developer)');
+                process.exit(1);
+              }
+            }
+          "
+          echo "[molley] max_words input is valid"
         fi
 
         if [ -n "${ROUTES:-}" ]; then
@@ -228,6 +253,7 @@ runs:
         REPORT_STYLE: ${{ inputs.report_style }}
         ROUTES: ${{ inputs.routes }}
         DAYS: ${{ inputs.days }}
+        MAX_WORDS: ${{ inputs.max_words }}
         CLAUDE_MODEL: ${{ inputs.model }}
         MCP_AVAILABLE: ${{ steps.mcp-setup.outputs.mcp_available }}
         MCP_PROJECT_ID: ${{ steps.mcp-setup.outputs.project_id }}
@@ -251,9 +277,32 @@ runs:
         fi
         echo "[molley] Report styles to generate: ${STYLES} (last ${DAYS} days each)"
 
+        resolve_word_limit() {
+          STYLE="$1" node -e "
+            const style = process.env.STYLE;
+            const raw = (process.env.MAX_WORDS || '').trim();
+            const defaults = { slt: 500 };
+            let limit = defaults[style] || 0;
+            if (/^\d+\$/.test(raw)) {
+              limit = parseInt(raw, 10);
+            } else if (raw) {
+              for (const part of raw.split(/[\n,]+/)) {
+                const m = part.trim().match(/^([a-z]+)\s*[:=]\s*(\d+)\$/i);
+                if (m && m[1].toLowerCase() === style) limit = parseInt(m[2], 10);
+              }
+            }
+            if (limit > 0) process.stdout.write(String(limit));
+          "
+        }
+
         build_prompt() {
           local STYLE="$1"
           local PROMPT_FILE="$2"
+          local WORD_LIMIT
+          WORD_LIMIT="$(resolve_word_limit "$STYLE")"
+          if [ -n "$WORD_LIMIT" ]; then
+            echo "[molley] ${STYLE} report word limit: ${WORD_LIMIT}" >&2
+          fi
           {
           printf '%s\n' "You are writing a periodic product progress report covering the last ${DAYS} days for the repository you are running in (a monorepo — treat top-level directories/workspaces as product areas)."
           printf '%s\n' ""
@@ -263,6 +312,9 @@ runs:
           printf '%s\n' "- Be honest: if something is stalled or blocked, say so plainly and factually."
           printf '%s\n' "- Never mention 'Molley' anywhere in the report — not as a tool name, data source, or brand. When you draw on its data, attribute it generically instead: 'the CRM', 'the requirements tool', 'product research', 'the product wiki', 'outreach tracking', and so on."
           printf '%s\n' "- Return MARKDOWN ONLY — no prose before or after the document, no code fences wrapping it."
+          if [ -n "$WORD_LIMIT" ]; then
+            printf '%s\n' "- LENGTH BUDGET (hard cap): the entire report must be at most ${WORD_LIMIT} words. Prioritise ruthlessly — keep only what changes the reader's understanding or next action, merge overlapping points, and prefer one sharp sentence over three. Keep every section heading, but a thin section can be a single bullet."
+          fi
           printf '%s\n' ""
           printf '%s\n' "HOW TO GATHER EVIDENCE:"
           printf '%s\n' "1. Start from the git digest below, then dig deeper yourself with git (e.g. 'git log --since=\"${DAYS} days ago\"', 'git show', 'git diff') and by reading the codebase to understand what the changes actually mean at product level. Interpret — do not just restate commit messages."
@@ -292,7 +344,7 @@ runs:
               printf '%s\n' "AUDIENCE: the senior leadership team."
               printf '%s\n' "- Write in plain business language; no code paths, file names, or technical jargon."
               printf '%s\n' "- Lead with momentum, risk, and strategic direction. Frame everything in terms of product outcomes, customer value, and delivery confidence."
-              printf '%s\n' "- Keep it tight: the whole report should be readable in under three minutes."
+              printf '%s\n' "- Keep it tight: the whole report should be readable in about a minute — an executive skim, not a document."
               ;;
             sales)
               printf '%s\n' "AUDIENCE: the sales and marketing team."

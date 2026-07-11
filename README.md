@@ -116,6 +116,7 @@ If one style's generation fails, the others still commit and deliver.
 | `report_style` | `developer` | `slt`, `sales`, or `developer` (ignored when `routes` is set) |
 | `routes` | — | Multi-report routing, one `style: platform:ENV_VAR, ...` line per report |
 | `days` | `7` | Look-back window in days (max 14, limited by the Molley activity API) |
+| `max_words` | — | Hard word cap: one number for all reports (`'600'`) or per style (`'slt: 400, developer: 900'`). Unset styles use built-in defaults: slt 500 words, sales/developer uncapped |
 | `molley_project_id` | — | Molley project passport (same value the analyzer action uses) |
 | `reports_dir` | `reports` | Directory the report is committed into |
 | `output_branch` | auto | Target branch; empty = `develop` if it exists, else `main` |
